@@ -1,65 +1,61 @@
-#ifndef HOUGHTRACKFINDER_H
-#define HOUGHTRACKFINDER_H
+#ifndef HOUGH_TRACK_FINDER_H
+#define HOUGH_TRACK_FINDER_H
 
 #include <fun4all/SubsysReco.h>
-#include <trackbase/TrkrDefs.h>
-#include <trackbase/TpcDefs.h>
-#include <string>
+#include <phool/PHCompositeNode.h>
+
 #include <vector>
 #include <map>
-
-class PHCompositeNode;
-class TrkrHitSetContainer;
-class PHG4TpcGeomContainer;
-class PHG4CylinderGeomContainer;
-class TH2F;
-class TFile;
-class TTree;
+#include <string>
+#include <utility>
+#include <TFile.h>
+#include <TH2F.h>
+#include <TTree.h>
 
 class HoughTrackFinder : public SubsysReco
 {
- public:
-  explicit HoughTrackFinder(const std::string &name = "HoughTrackFinder", const std::string &filename = "hough_tracks.root");
-  ~HoughTrackFinder() override {}
-
-  int Init(PHCompositeNode *) override;
-  int process_event(PHCompositeNode *) override;
-  int End(PHCompositeNode *) override;
-
- private:
-  struct HitXY {
+public:
+  struct HitXY
+  {
     double x;
     double y;
   };
 
-  // Internal helper functions
+  explicit HoughTrackFinder(const std::string &name = "HoughTrackFinder",
+                            const std::string &filename = "hough_output.root");
+
+  ~HoughTrackFinder() override = default;
+
+  int Init(PHCompositeNode *topNode) override;
+  int process_event(PHCompositeNode *topNode) override;
+  int End(PHCompositeNode *topNode) override;
+
+private:
   void fillHough(const std::vector<HitXY> &hits);
   void findPeaks();
   void assignHitsToTracks(const std::vector<HitXY> &hits);
   void clearEvent();
 
-
+  // Output
   std::string m_outputFileName;
-  TFile *m_outputFile;
-  TTree *m_tree;
+  TFile *m_outputFile = nullptr;
+  TH2F *h_hough = nullptr;
+  TTree *m_tree = nullptr;
 
+  // Event variables
+  int m_nhits = 0;
+  float m_rho = 0;
+  float m_theta = 0;
 
   // Parameters
-  int n_theta_bins = 180;
-  int n_rho_bins   = 200;
-  double max_rho   = 100.0; // cm
-  double peak_threshold_fraction = 0.5;
-  double max_hit_distance = 0.5; // cm
+  static constexpr int n_theta_bins = 360;
+  static constexpr int n_rho_bins   = 200;
+  static constexpr double max_rho   = 5.0;             // ±5 cm constraint
+  static constexpr double peak_threshold_fraction = 0.5;
+  static constexpr double max_hit_distance = 0.3;      // cm tolerance when grouping
 
-  // Hough accumulator
-  TH2F* h_hough = nullptr;
-  float m_rho = -9999, m_theta = -9999;
-  int m_nhits = 0;
-
-  // Found peaks (θ,ρ)
-  std::vector<std::pair<double,double>> track_peaks;
-
-  // Hits per track
+  // Internal storage
+  std::vector<std::pair<double, double>> track_peaks;  // (θ, ρ)
   std::map<int, std::vector<HitXY>> track_hits;
 };
 
