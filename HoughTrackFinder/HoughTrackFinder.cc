@@ -1,3 +1,7 @@
+//============================================================
+// HoughTrackFinder.cc  — 3D straight-line Hough (r,φ,z)
+//============================================================
+
 #include "HoughTrackFinder.h"
 
 #include <trackbase/TrkrHitSetContainer.h>
@@ -15,6 +19,7 @@
 
 #include <cmath>
 #include <iostream>
+#include <algorithm>
 
 //============================================================
 // Constructor
@@ -29,24 +34,27 @@ HoughTrackFinder::HoughTrackFinder(const std::string &name, const std::string &f
 //============================================================
 int HoughTrackFinder::Init(PHCompositeNode* /*topNode*/)
 {
-  std::cout << "HoughTrackFinder::Init - Creating output file: " << m_outputFileName << std::endl;
+  std::cout << "HoughTrackFinder::Init - Creating output file: "
+            << m_outputFileName << std::endl;
 
   m_outputFile = new TFile(m_outputFileName.c_str(), "RECREATE");
   if (!m_outputFile || m_outputFile->IsZombie())
   {
-    std::cerr << "HoughTrackFinder::Init - ERROR: Cannot create output file " << m_outputFileName << std::endl;
+    std::cerr << "ERROR: cannot create " << m_outputFileName << std::endl;
     return Fun4AllReturnCodes::ABORTRUN;
   }
 
-  // Only ±5 cm around origin
-  h_hough = new TH2F("h_hough", "Hough accumulator;#theta [rad];#rho [cm]",
+  h_hough = new TH2F("h_hough", "Hough XY;#theta [rad];#rho [cm]",
                      n_theta_bins, -M_PI/2, M_PI/2,
                      n_rho_bins, -max_rho, max_rho);
 
-  m_tree = new TTree("phase_tree", "Hough Line Reconstruction");
-  m_tree->Branch("nhits", &m_nhits, "m_nhits/I");
-  m_tree->Branch("rho", &m_rho, "m_rho/F");
-  m_tree->Branch("theta", &m_theta, "m_theta/F");
+  m_tree = new TTree("phase_tree", "3D Hough Line Reconstruction");
+  m_tree->Branch("nhits", &m_nhits, "nhits/I");
+  m_tree->Branch("rho", &m_rho, "rho/F");
+  m_tree->Branch("theta", &m_theta, "theta/F");
+  m_tree->Branch("dzdr", &m_slope_dzdr, "dzdr/F");
+  m_tree->Branch("phi", &m_phi, "phi/F");
+  m_tree->Branch("z0", &m_z0, "z0/F");
 
   return Fun4AllReturnCodes::EVENT_OK;
 }
@@ -57,37 +65,27 @@ int HoughTrackFinder::Init(PHCompositeNode* /*topNode*/)
 int HoughTrackFinder::process_event(PHCompositeNode* topNode)
 {
   auto *hitmap = findNode::getClass<TrkrHitSetContainer>(topNode, "TRKR_HITSET");
-  if (!hitmap)
-  {
-    std::cerr << "HoughTrackFinder::process_event - No TRKR_HITSET node found!" << std::endl;
-    return Fun4AllReturnCodes::ABORTEVENT;
-  }
+  if (!hitmap) return Fun4AllReturnCodes::ABORTEVENT;
 
   auto *tpcGeom = findNode::getClass<PHG4TpcGeomContainer>(topNode, "TPCGEOMCONTAINER");
   auto *geometry = findNode::getClass<ActsGeometry>(topNode, "ActsGeometry");
-  if (!tpcGeom || !geometry)
-  {
-    std::cerr << "HoughTrackFinder::process_event - Missing geometry nodes!" << std::endl;
-    return Fun4AllReturnCodes::ABORTEVENT;
-  }
+  if (!tpcGeom || !geometry) return Fun4AllReturnCodes::ABORTEVENT;
 
   clearEvent();
-
-  std::vector<HitXY> hits;
+  std::vector<HitXYZ> hits;
 
   //------------------------------------------------------------
-  // 1. Collect (x,y) positions from all TPC hits
+  // 1. Collect hits (x,y,z)
   //------------------------------------------------------------
-  TrkrHitSetContainer::ConstRange all_hitsets = hitmap->getHitSets();
-  for (auto hitsetiter = all_hitsets.first; hitsetiter != all_hitsets.second; ++hitsetiter)
+  for (auto hitsetiter = hitmap->getHitSets().first;
+       hitsetiter != hitmap->getHitSets().second; ++hitsetiter)
   {
     auto hitsetkey = hitsetiter->first;
     TrkrHitSet* hitset = hitsetiter->second;
-    if (TrkrDefs::getTrkrId(hitsetkey) != TrkrDefs::tpcId)
-      continue;
+    if (TrkrDefs::getTrkrId(hitsetkey) != TrkrDefs::tpcId) continue;
 
     unsigned int layer = TrkrDefs::getLayer(hitsetkey);
-    unsigned int side = TpcDefs::getSide(hitsetkey);
+    unsigned int side  = TpcDefs::getSide(hitsetkey);
     auto *geoLayer = tpcGeom->GetLayerCellGeom(layer);
 
     for (auto hitr = hitset->getHits().first; hitr != hitset->getHits().second; ++hitr)
@@ -97,160 +95,208 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
       double phi = geoLayer->get_phicenter(pad, side);
       double radius = geoLayer->get_radius();
       float AdcClockPeriod = geoLayer->get_zstep();
-      auto glob = geometry->getGlobalPositionTpc(hitsetkey, hitkey, phi, radius, AdcClockPeriod);
 
-      hits.push_back({glob.x(), glob.y()});
+      auto glob = geometry->getGlobalPositionTpc(hitsetkey, hitkey, phi, radius, AdcClockPeriod);
+      hits.push_back({glob.x(), glob.y(), glob.z()});
     }
   }
 
-  if (hits.empty())
-  {
-    std::cout << "HoughTrackFinder::process_event - No hits found in event." << std::endl;
-    return Fun4AllReturnCodes::EVENT_OK;
-  }
+  if (hits.empty()) return Fun4AllReturnCodes::EVENT_OK;
 
   //------------------------------------------------------------
-  // 2. Fill Hough accumulator
+  // 2D Hough in XY
   //------------------------------------------------------------
   fillHough(hits);
-
-  //------------------------------------------------------------
-  // 3. Find peaks
-  //------------------------------------------------------------
   findPeaks();
-
-  //------------------------------------------------------------
-  // 4. Assign hits to tracks
-  //------------------------------------------------------------
   assignHitsToTracks(hits);
 
   //------------------------------------------------------------
-  // 5. Output summary
+  // 3D: (k,z0) per XY line
   //------------------------------------------------------------
-  std::cout << "HoughTrackFinder: found " << track_peaks.size() << " track candidates" << std::endl;
+  track_kz.clear();
+  for (size_t i = 0; i < track_peaks.size(); ++i) houghKZForTrack(i);
+
+  //------------------------------------------------------------
+  // Save
+  //------------------------------------------------------------
   for (size_t i = 0; i < track_peaks.size(); ++i)
   {
     m_nhits = track_hits[i].size();
+    if (m_nhits < 3) continue;
+
     m_theta = track_peaks[i].first;
     m_rho   = track_peaks[i].second;
-    m_tree->Fill();
 
-    std::cout << "  Track " << i
-              << " θ=" << m_theta << " ρ=" << m_rho
-              << " with " << m_nhits << " hits" << std::endl;
+    const auto kz = (i < track_kz.size()) ? track_kz[i] : std::pair<float,float>{0.f,0.f};
+    m_slope_dzdr = kz.first;
+    m_z0         = kz.second;
+    m_phi        = std::atan(m_slope_dzdr);
+
+    m_tree->Fill();
   }
 
   return Fun4AllReturnCodes::EVENT_OK;
 }
 
 //============================================================
-// Fill Hough accumulator (θ, ρ) within ±5 cm constraint
+// fillHough
 //============================================================
-void HoughTrackFinder::fillHough(const std::vector<HitXY> &hits)
+void HoughTrackFinder::fillHough(const std::vector<HitXYZ> &hits)
 {
   h_hough->Reset();
-
-  for (const auto &hit : hits)
+  for (const auto &h : hits)
   {
-    for (int itheta = 0; itheta < n_theta_bins; ++itheta)
+    for (int it = 0; it < n_theta_bins; ++it)
     {
-      double theta = -M_PI/2 + itheta * M_PI / n_theta_bins;
-      double rho = hit.x * std::cos(theta) + hit.y * std::sin(theta);
-
-      // Only fill if line passes within ±5 cm of origin
-      if (std::fabs(rho) < max_rho)
-        h_hough->Fill(theta, rho);
+      double theta = -M_PI/2 + it * M_PI / n_theta_bins;
+      double rho = h.x * std::cos(theta) + h.y * std::sin(theta);
+      if (std::fabs(rho) <= max_rho) h_hough->Fill(theta, rho);
     }
   }
 }
 
 //============================================================
-// Find peaks (local maxima) above threshold
+// findPeaks in XY
 //============================================================
 void HoughTrackFinder::findPeaks()
 {
   track_peaks.clear();
+  const int nx = h_hough->GetNbinsX();
+  const int ny = h_hough->GetNbinsY();
+  const double maxvote = h_hough->GetMaximum();
+  const double thr = peak_threshold_fraction * maxvote;
 
-  int ntheta = h_hough->GetNbinsX();
-  int nrho   = h_hough->GetNbinsY();
-  double maxvote = h_hough->GetMaximum();
-  double threshold = peak_threshold_fraction * maxvote;
-
-  for (int ix = 2; ix < ntheta - 1; ++ix)
+  for (int ix=2; ix<nx-1; ++ix)
+  for (int iy=2; iy<ny-1; ++iy)
   {
-    for (int iy = 2; iy < nrho - 1; ++iy)
+    const double v = h_hough->GetBinContent(ix,iy);
+    if (v<thr) continue;
+    bool localmax=true;
+    for (int dx=-1; dx<=1 && localmax; ++dx)
+    for (int dy=-1; dy<=1; ++dy)
     {
-      double val = h_hough->GetBinContent(ix, iy);
-      if (val < threshold) continue;
-
-      bool isLocalMax = true;
-      for (int dx = -1; dx <= 1 && isLocalMax; ++dx)
-        for (int dy = -1; dy <= 1; ++dy)
-        {
-          if (dx == 0 && dy == 0) continue;
-          if (h_hough->GetBinContent(ix + dx, iy + dy) > val)
-          {
-            isLocalMax = false;
-            break;
-          }
-        }
-
-      if (isLocalMax)
-      {
-        double theta = h_hough->GetXaxis()->GetBinCenter(ix);
-        double rho   = h_hough->GetYaxis()->GetBinCenter(iy);
-        track_peaks.push_back({theta, rho});
-      }
+      if(dx==0 && dy==0) continue;
+      if(h_hough->GetBinContent(ix+dx,iy+dy)>v) localmax=false;
     }
+    if(!localmax) continue;
+
+    double th = h_hough->GetXaxis()->GetBinCenter(ix);
+    double rh = h_hough->GetYaxis()->GetBinCenter(iy);
+    if (std::fabs(rh) <= max_rho) track_peaks.push_back({th, rh});
   }
 }
 
 //============================================================
-// Assign hits to nearest line candidate
+// assignHitsToTracks
 //============================================================
-void HoughTrackFinder::assignHitsToTracks(const std::vector<HitXY> &hits)
+void HoughTrackFinder::assignHitsToTracks(const std::vector<HitXYZ> &hits)
 {
   track_hits.clear();
+  for(size_t i=0;i<track_peaks.size();++i)
+    track_hits[(int)i]={};
 
-  for (const auto &hit : hits)
+  for(const auto &h:hits)
   {
-    double bestDist = 1e9;
-    int bestTrack = -1;
-
-    for (size_t i = 0; i < track_peaks.size(); ++i)
+    int best=-1; double bestd=1e9;
+    for(size_t i=0;i<track_peaks.size();++i)
     {
-      auto [theta, rho] = track_peaks[i];
-      double d = std::fabs(hit.x * std::cos(theta) + hit.y * std::sin(theta) - rho);
-      if (d < bestDist)
-      {
-        bestDist = d;
-        bestTrack = i;
-      }
+      const auto &p=track_peaks[i];
+      double d=xyDistanceToLine(h.x,h.y,p.first,p.second);
+      if(d<bestd){bestd=d;best=(int)i;}
     }
-
-    // Keep only hits within a narrow band around each line
-    if (bestTrack >= 0 && bestDist < max_hit_distance)
-      track_hits[bestTrack].push_back(hit);
+    if(best>=0 && bestd<=assign_xy_maxdist)
+      track_hits[best].push_back(h);
   }
 }
 
+double HoughTrackFinder::xyDistanceToLine(double x,double y,double theta,double rho) const
+{
+  return std::fabs(x*std::cos(theta)+y*std::sin(theta)-rho);
+}
+
 //============================================================
-// Clear event
+// 2D Hough in (k,z0) for each XY line
+//============================================================
+void HoughTrackFinder::houghKZForTrack(size_t itrk)
+{
+  if(h_kz){delete h_kz; h_kz=nullptr;}
+  h_kz=new TH2F("h_kz","k-z0 accumulator;k=dz/dr;z0[cm]",
+                n_k_bins,k_min,k_max,n_z0_bins,z0_min,z0_max);
+
+  const auto &hits=track_hits[(int)itrk];
+  if(hits.size()<3) return;
+
+  std::vector<std::pair<double,double>> rz;
+  rz.reserve(hits.size());
+  for(const auto &h:hits)
+    rz.emplace_back(std::sqrt(h.x*h.x+h.y*h.y),h.z);
+
+  for(const auto &p:rz)
+  {
+    const double r=p.first;
+    const double z=p.second;
+    for(int ik=1;ik<=n_k_bins;++ik)
+    {
+      const double k=h_kz->GetXaxis()->GetBinCenter(ik);
+      const double z0=z-k*r;
+      if(std::fabs(z0)<=10.0) h_kz->Fill(k,z0);
+    }
+  }
+
+  auto best=findKZPeak(h_kz,0.5);
+  if(itrk>=track_kz.size()) track_kz.resize(itrk+1,{0.f,0.f});
+  track_kz[itrk]=best;
+}
+
+std::pair<float,float> HoughTrackFinder::findKZPeak(TH2F* acc,float frac)
+{
+  if(!acc) return {0.f,0.f};
+  const double maxv=acc->GetMaximum();
+  const double thr=std::max(1.0,frac*maxv);
+  int nx=acc->GetNbinsX(),ny=acc->GetNbinsY();
+  double bestv=-1; int bix=1,biy=1;
+
+  for(int ix=2;ix<nx;++ix)
+  for(int iy=2;iy<ny;++iy)
+  {
+    double v=acc->GetBinContent(ix,iy);
+    if(v<thr) continue;
+    bool loc=true;
+    for(int dx=-1;dx<=1&&loc;++dx)
+    for(int dy=-1;dy<=1;++dy)
+    {
+      if(dx==0&&dy==0) continue;
+      if(acc->GetBinContent(ix+dx,iy+dy)>v) loc=false;
+    }
+    if(loc&&v>bestv){bestv=v;bix=ix;biy=iy;}
+  }
+
+  float k=acc->GetXaxis()->GetBinCenter(bix);
+  float z0=acc->GetYaxis()->GetBinCenter(biy);
+  return {k,z0};
+}
+
+//============================================================
+// clearEvent / End
 //============================================================
 void HoughTrackFinder::clearEvent()
 {
-  track_peaks.clear();
-  track_hits.clear();
+  if(h_hough)h_hough->Reset("ICES");
+  if(h_kz)h_kz->Reset("ICES");
+  track_peaks.clear(); track_hits.clear(); track_kz.clear();
+  m_nhits=0; m_rho=0; m_theta=0; m_slope_dzdr=0; m_phi=0; m_z0=0;
 }
 
-//============================================================
-// End of job
-//============================================================
-int HoughTrackFinder::End(PHCompositeNode* /*topNode*/)
+int HoughTrackFinder::End(PHCompositeNode*)
 {
-  m_outputFile->cd();
-  h_hough->Write();
-  m_tree->Write();
-  m_outputFile->Close();
+  if(m_outputFile)
+  {
+    m_outputFile->cd();
+    if(h_hough)h_hough->Write();
+    if(m_tree)m_tree->Write();
+    m_outputFile->Close();
+    delete m_outputFile; m_outputFile=nullptr;
+  }
+  if(h_kz){delete h_kz;h_kz=nullptr;}
   return Fun4AllReturnCodes::EVENT_OK;
 }
