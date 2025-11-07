@@ -33,7 +33,7 @@
 #endif
 
 // Boost geometry/index (R-tree)
-#include <boost/geometry.hpp>
+/*#include <boost/geometry.hpp>
 #include <boost/geometry/geometries/point.hpp>
 #include <boost/geometry/geometries/box.hpp>
 #include <boost/geometry/index/rtree.hpp>
@@ -41,16 +41,18 @@
 using std::sqrt;
 namespace bg  = boost::geometry;
 namespace bgi = boost::geometry::index;
+*/
+
 
 // ----------------- Private impl for the R-tree -----------------
-struct HoughTrackFinder::RtreeImpl
+/*struct RtreeImpl
 {
   typedef bg::model::point<float, 3, bg::cs::cartesian> Point3D;
   typedef bg::model::box<Point3D> Box3D;
   typedef std::pair<Point3D, unsigned int> Leaf; // (x,y,z) with index
   typedef bgi::rtree< Leaf, bgi::quadratic<16> > RTree;
   RTree tree;
-};
+};*/
 
 //============================================================
 // ctor/dtor
@@ -61,7 +63,9 @@ HoughTrackFinder::HoughTrackFinder(const std::string &name,
   , _min_layer(7)
   , _max_layer(55)
   , _knn(15)
-  , _stub_window_xy(5.0)
+  , _stub_window_r(3)
+  , _stub_window_phi(0.0053073*8)
+  , _stub_window_z(3)
   , _max_z_residual(3.0)
   , _min_stubs(6)
   , _min_hits(20)
@@ -72,7 +76,6 @@ HoughTrackFinder::HoughTrackFinder(const std::string &name,
   , m_outputFile(0)
   , _ntp_hits(0)
   , _ntp_stubs(0)
-  , _ntp_tracks(0)
   , _nevent(0)
   , _rtree(0)
 {
@@ -96,8 +99,8 @@ int HoughTrackFinder::Init(PHCompositeNode * /*topNode*/)
   }
 
   _ntp_hits   = new TNtuple("hits",   "hits",   "event:x:y:z");
-  _ntp_stubs  = new TNtuple("stubs",  "stubs",  "event:slope:z0:rho:theta:npts");
-  _ntp_tracks = new TNtuple("tracks", "tracks", "event:slope:z0:rho:theta:nhits");
+  _ntp_stubs  = new TNtuple("stubs",  "stubs",  "event:d0:z0:phi0:theta:qOverP:npts");
+
 
   return Fun4AllReturnCodes::EVENT_OK;
 }
@@ -109,7 +112,7 @@ int HoughTrackFinder::process_event(PHCompositeNode *topNode)
 {
   m_hits.clear();
   m_stubs.clear();
-  m_tracks.clear();
+
   if (_rtree) { delete _rtree; _rtree = 0; }
 
   int ret = collectHits(topNode);
@@ -118,43 +121,31 @@ int HoughTrackFinder::process_event(PHCompositeNode *topNode)
 
   buildRtree();
   fitLocalStubs();
-  computeStubXYParameters();
+
   if (m_stubs.empty()) { _nevent++; return Fun4AllReturnCodes::EVENT_OK; }
 
-  clusterStubs();
-  if (m_tracks.empty()) { _nevent++; return Fun4AllReturnCodes::EVENT_OK; }
+ // clusterStubs();
+//  if (m_tracks.empty()) { _nevent++; return Fun4AllReturnCodes::EVENT_OK; }
 
-  assignHitsToTracks();
-  computeXYParameters();  // <-- new step
+
 
 if (_ntp_stubs)
 {
   for (size_t i = 0; i < m_stubs.size(); ++i)
   {
+    const Stub &s = m_stubs[i];
     _ntp_stubs->Fill((float)_nevent,
-                     m_stubs[i].slope,
-                     m_stubs[i].z0,
-                     m_stubs[i].rho,
-                     m_stubs[i].theta,
-                     (float)m_stubs[i].npoints);
+                     s.d0,
+                     s.z0,
+                     s.phi0,
+                     s.theta,
+                     s.qOverP,
+                     (float)s.npoints);
   }
 }
 
-  // Write output
-  if (_ntp_tracks)
-  {
-    for (size_t i = 0; i < m_tracks.size(); ++i)
-    {
-      if (m_tracks[i].nhits >= (int)_min_hits)
-      {
-        _ntp_tracks->Fill((float)_nevent,
-                          m_tracks[i].slope, m_tracks[i].z0,
-                          (float)m_tracks[i].nhits,
-                          m_tracks[i].rho, m_tracks[i].theta);
-      }
-    }
-  }
 
+  
   _nevent++;
   return Fun4AllReturnCodes::EVENT_OK;
 }
@@ -169,7 +160,6 @@ int HoughTrackFinder::End(PHCompositeNode * /*topNode*/)
     m_outputFile->cd();
     if (_ntp_hits)   _ntp_hits->Write();
     if (_ntp_stubs)  _ntp_stubs->Write();
-    if (_ntp_tracks) _ntp_tracks->Write();
     m_outputFile->Close();
     delete m_outputFile; m_outputFile = 0;
   }
@@ -209,6 +199,9 @@ int HoughTrackFinder::collectHits(PHCompositeNode *topNode)
     for (TrkrHitSet::ConstIterator hitr = range.first; hitr != range.second; ++hitr)
     {
       TrkrDefs::hitkey hitkey = hitr->first;
+      auto *hit = hitr->second;
+      int m_adc = hit->getAdc();
+      if (m_adc < 40) continue; // adc cut
       unsigned int pad = TpcDefs::getPad(hitkey);
       double phi = geoLayer->get_phicenter(pad, side);
       Acts::Vector3 glob = geometry->getGlobalPositionTpc(hitsetkey, hitkey, phi, radius, AdcClockPeriod);
@@ -233,31 +226,12 @@ void HoughTrackFinder::buildRtree()
   for (unsigned int i = 0; i < m_hits.size(); ++i)
   {
     const HitXYZ &h = m_hits[i];
-    HoughTrackFinder::RtreeImpl::Point3D p(h.x, h.y, h.z);
+    RtreeImpl::Point3D p(h.x, h.y, h.z);
     _rtree->tree.insert(std::make_pair(p, i));
   }
 }
 
-// linear regression helper
-static inline bool linear_fit_rz(const std::vector<std::pair<float,float> > &rz,
-                                 float &slope, float &z0)
-{
-  if (rz.size() < 3) return false;
-  double sumr=0,sumz=0,sumr2=0,sumrz=0;
-  const unsigned int n=(unsigned int)rz.size();
-  for (unsigned int i=0;i<n;++i)
-  {
-    sumr+=rz[i].first;
-    sumz+=rz[i].second;
-    sumr2+=rz[i].first*rz[i].first;
-    sumrz+=rz[i].first*rz[i].second;
-  }
-  const double denom = (double)n*sumr2 - sumr*sumr;
-  if (fabs(denom)<1e-8) return false;
-  slope=(float)(((double)n*sumrz - sumr*sumz)/denom);
-  z0=(float)((sumz - slope*sumr)/n);
-  return true;
-}
+
 
 void HoughTrackFinder::fitLocalStubs()
 {
@@ -268,14 +242,14 @@ void HoughTrackFinder::fitLocalStubs()
   const unsigned int N = (unsigned int)m_hits.size();
   std::vector< std::vector<Stub> > thread_stubs;
   unsigned int nthreads=1;
-#ifdef _OPENMP
-  nthreads = (unsigned int)omp_get_max_threads();
-#endif
+//#ifdef _OPENMP
+//  nthreads = (unsigned int)omp_get_max_threads();
+//#endif
   thread_stubs.resize(nthreads);
 
-#ifdef _OPENMP
-#pragma omp parallel for schedule(dynamic)
-#endif
+//#ifdef _OPENMP
+//#pragma omp parallel for schedule(dynamic)
+//#endif
   for (int i=0;i<(int)N;++i)
   {
     const HitXYZ &h = m_hits[(unsigned int)i];
@@ -286,233 +260,264 @@ void HoughTrackFinder::fitLocalStubs()
       _rtree->tree.query(bgi::nearest(RtreeImpl::Point3D(h.x,h.y,h.z),(int)_knn),std::back_inserter(neigh));
     else
     {
-      float w=_stub_window_xy;
-      RtreeImpl::Box3D box(RtreeImpl::Point3D(h.x-w,h.y-w,h.z-w),
-                           RtreeImpl::Point3D(h.x+w,h.y+w,h.z+w));
+      float rwin = _stub_window_r;
+      float phiwin = _stub_window_phi;
+      float zwin = _stub_window_z;
+
+      float r   = sqrt(h.x*h.x + h.y*h.y);
+      float phi = atan2(h.y, h.x);
+      float dx = fabs(cos(phi) * rwin) + fabs(r * sin(phi) * phiwin);
+      float dy = fabs(sin(phi) * rwin) + fabs(r * cos(phi) * phiwin);
+      float dz = zwin;
+          std::cout<<"Box for hit "<<i<<" : "<<h.x - dx<<" "<<h.y - dy<<" "<<h.z - dz<<" to "
+                    <<h.x + dx<<" "<<h.y + dy<<" "<<h.z + dz<<"    point "<<h.x<<" "<<h.y<<" "<<h.z<<"    delta "<<dx<<" "<<dy<<" "<<dz<<std::endl;
+      RtreeImpl::Box3D box(
+          RtreeImpl::Point3D(h.x - dx, h.y - dy, h.z - dz),
+          RtreeImpl::Point3D(h.x + dx, h.y + dy, h.z + dz));
+
       _rtree->tree.query(bgi::intersects(box),std::back_inserter(neigh));
     }
-    if (neigh.size()<4) continue;
+    std::cout<<"Found "<<neigh.size()<<" neighbors for hit "<<i<<std::endl;
+    if (neigh.size()<3) continue;
 
-    std::vector< std::pair<float,float> > rz;
-    rz.reserve(neigh.size());
-    for (size_t j=0;j<neigh.size();++j)
-    {
-      const HitXYZ &hn = m_hits[neigh[j].second];
-      rz.push_back(std::make_pair(sqrt(hn.x*hn.x+hn.y*hn.y), hn.z));
-    }
-    if (rz.size()<4) continue;
 
-    float slope=0,z0=0;
-    if (!linear_fit_rz(rz,slope,z0)) continue;
-    if (fabs(z0) > Z0_MAX) continue; 
+float d0=0, z0=0, phi0=0, theta=0, qOverP=0;
+if (!helix_fit_3D(neigh, m_hits, d0, z0, phi0, theta, qOverP)) continue;
 
-#ifdef _OPENMP
-    unsigned int tid=(unsigned int)omp_get_thread_num();
-#else
+
+//#ifdef _OPENMP
+//    unsigned int tid=(unsigned int)omp_get_thread_num();
+//#else
     unsigned int tid=0;
-#endif
-    Stub s; s.slope=slope; s.z0=z0; s.npoints=(int)rz.size();
+//#endif
+    Stub s; 
+    s.d0 = d0;
+    s.z0 = z0;
+    s.phi0 = phi0;
+    s.theta = theta;
+    s.qOverP = qOverP;
+    s.npoints = (int)neigh.size();
+
     thread_stubs[tid].push_back(s);
   }
 
   for (unsigned int t=0;t<thread_stubs.size();++t)
     m_stubs.insert(m_stubs.end(),thread_stubs[t].begin(),thread_stubs[t].end());
 
-  if (_ntp_stubs)
+ /* if (_ntp_stubs)
   {
     for (size_t i=0;i<m_stubs.size();++i)
-      _ntp_stubs->Fill((float)_nevent,m_stubs[i].slope,m_stubs[i].z0,(float)m_stubs[i].npoints);
-  }
+        _ntp_stubs->Fill((float)_nevent, d0, z0, phi0, theta, qOverP, (float)npoints);
+  }*/
 }
 
-void HoughTrackFinder::clusterStubs()
+
+// Build a best-fit straight line r(t) = r0 + t * vhat from the neighbor hits.
+// Use a simple PCA/power-iteration or (good enough) fit vhat as the
+// normalized difference of the farthest pair of points in neigh.
+
+void HoughTrackFinder::fit_straight_line_xyz(
+  const std::vector<RtreeImpl::Leaf>& neigh,
+  const std::vector<HitXYZ>& hits,
+  double& r0x, double& r0y, double& r0z,
+  double& vx,  double& vy,  double& vz)
 {
-  m_tracks.clear();
-  if (m_stubs.empty()) return;
-
-  struct Acc { int count; double sumK,sumZ0; };
-  std::map<std::pair<int,int>,Acc> bins;
-  const float inv_slope_bin=1.f/_slope_bin, inv_z0_bin=1.f/_z0_bin;
-
-  for (size_t i=0;i<m_stubs.size();++i)
-  {
-    const float k=m_stubs[i].slope, z0=m_stubs[i].z0;
-    int ib=(int)floor(k*inv_slope_bin + (k>=0?0.5f:-0.5f));
-    int jb=(int)floor(z0*inv_z0_bin + (z0>=0?0.5f:-0.5f));
-    std::pair<int,int> key(ib,jb);
-    std::map<std::pair<int,int>,Acc>::iterator it=bins.find(key);
-    if (it==bins.end())
-    { Acc a={1,k,z0}; bins.insert(std::make_pair(key,a)); }
-    else { it->second.count++; it->second.sumK+=k; it->second.sumZ0+=z0; }
+  // centroid
+  double sx=0, sy=0, sz=0; size_t n=neigh.size();
+  for (size_t i=0;i<n;++i){ const HitXYZ& h=hits[neigh[i].second]; sx+=h.x; sy+=h.y; sz+=h.z; 
+  std::cout<<"  neighbor "<<i<<" : "<<h.x<<" "<<h.y<<" "<<h.z<<std::endl;
   }
+  r0x=sx/n; r0y=sy/n; r0z=sz/n;
 
-  typedef std::pair<std::pair<int,int>,Acc> BinEntry;
-  std::vector<BinEntry> sorted; sorted.reserve(bins.size());
-  for (std::map<std::pair<int,int>,Acc>::iterator it=bins.begin();it!=bins.end();++it)
-    sorted.push_back(*it);
-
-  struct BinCompare {
-    bool operator()(const BinEntry &a,const BinEntry &b) const {
-      if (a.second.count!=b.second.count) return a.second.count>b.second.count;
-      if (a.first.first!=b.first.first) return a.first.first<b.first.first;
-      return a.first.second<b.first.second;
+  // crude direction: farthest-pair heuristic (robust enough for stubs)
+  size_t i0=0, i1=0; double maxd2=-1;
+  for(size_t i=0;i<n;++i){
+    const HitXYZ& a=hits[neigh[i].second];
+    for(size_t j=i+1;j<n;++j){
+      const HitXYZ& b=hits[neigh[j].second];
+      double dx=b.x-a.x, dy=b.y-a.y, dz=b.z-a.z;
+      double d2=dx*dx+dy*dy+dz*dz;
+      if(d2>maxd2){maxd2=d2;i0=i;i1=j;}
     }
-  };
-  std::sort(sorted.begin(),sorted.end(),BinCompare());
-
-  std::set<std::pair<int,int> > used_bins;
-  const int dI[5]={0,1,-1,0,0}, dJ[5]={0,0,0,1,-1};
-
-  for (size_t i=0;i<sorted.size();++i)
-  {
-    const std::pair<int,int> key=sorted[i].first;
-    const Acc &acc=sorted[i].second;
-    if (acc.count<(int)_min_stubs) continue;
-    bool neighbor=false;
-    for (int d=0;d<5;++d){
-      std::pair<int,int> nb(key.first+dI[d],key.second+dJ[d]);
-      if (used_bins.count(nb)){neighbor=true;break;}
-    }
-    if (neighbor) continue;
-
-    Track tr;
-    tr.slope=(float)(acc.sumK/acc.count);
-    tr.z0=(float)(acc.sumZ0/acc.count);
-    if (fabs(tr.z0) > Z0_MAX) continue;
-    tr.nhits=0; tr.rho=0; tr.theta=0;
-    m_tracks.push_back(tr);
-    used_bins.insert(key);
-    if (m_tracks.size()>=_max_tracks) break;
   }
+  const HitXYZ& A=hits[neigh[i0].second];
+  const HitXYZ& B=hits[neigh[i1].second];
+  vx=B.x-A.x; vy=B.y-A.y; vz=B.z-A.z;
+  double norm=std::sqrt(vx*vx+vy*vy+vz*vz); if(norm<1e-12){ vx=1; vy=0; vz=0; } else { vx/=norm; vy/=norm; vz/=norm; }
+  
 }
 
-void HoughTrackFinder::assignHitsToTracks()
+bool HoughTrackFinder::to_straight_perigee(
+  const std::vector<RtreeImpl::Leaf>& neigh,
+  const std::vector<HitXYZ>& hits,
+  float& d0, float& z0, float& phi0, float& theta, float& qOverP)
 {
-  if (m_tracks.empty()) return;
-  const unsigned int N=(unsigned int)m_hits.size();
+  double r0x, r0y, r0z, vx, vy, vz;
+  std::cout<<"HoughTrackFinder::to_straight_perigee "<<neigh.size()<<" points"<<std::endl;
+  fit_straight_line_xyz(neigh, hits, r0x, r0y, r0z, vx, vy, vz);
+std::cout<<"  straight line: r0 = ("<<r0x<<", "<<r0y<<", "<<r0z<<") v = ("<<vx<<", "<<vy<<", "<<vz<<")"<<std::endl;
+  // direction → angles
+  phi0  = (float)std::atan2(vy, vx);
+  double vT2 = vx*vx + vy*vy;
 
-  for (size_t it=0;it<m_tracks.size();++it)
-  {
-    int assigned=0;
-    const float k=m_tracks[it].slope;
-    const float z0=m_tracks[it].z0;
-    for (unsigned int i=0;i<N;++i)
-    {
-      const HitXYZ &h=m_hits[i];
-      const float r=sqrt(h.x*h.x+h.y*h.y);
-      const float zpred=k*r+z0;
-      const float dz=fabs(h.z-zpred);
-      if (dz<=_max_z_residual) assigned++;
-    }
-    m_tracks[it].nhits=assigned;
-  }
+  // closest approach to z-axis
+  double tstar = 0.0;
+  if (vT2 > 1e-12) tstar = -(r0x*vx + r0y*vy)/vT2;
+  double xP = r0x + tstar*vx;
+  double yP = r0y + tstar*vy;
+  double zP = r0z + tstar*vz;
 
-  std::vector<Track> kept;
-  kept.reserve(m_tracks.size());
-  for (size_t i=0;i<m_tracks.size();++i)
-    if (m_tracks[i].nhits>=(int)_min_hits) kept.push_back(m_tracks[i]);
-  m_tracks.swap(kept);
+  // perigee params
+  d0   = (float)(-xP*std::sin(phi0) + yP*std::cos(phi0));
+  z0   = (float)zP;
+  double vz_clamped = std::max(-1.0, std::min(1.0, vz));
+  theta = (float)std::acos(vz_clamped);   // polar angle to z-axis
+  qOverP = 0.0f;                          // straight line ⇒ zero curvature
+std::cout<<"  perigee params: d = "<<d0<<" z0 = "<<z0<<" phi0 = "<<phi0<<" theta = "<<theta<<std::endl;
+  return std::isfinite(d0) && std::isfinite(z0) && std::isfinite(phi0)
+      && std::isfinite(theta);
 }
 
 //============================================================
-// Compute (rho, theta) in XY for each track
+// 3D Helix fit (perigee parameters) with parameter constraints
 //============================================================
-void HoughTrackFinder::computeXYParameters()
+bool HoughTrackFinder::helix_fit_3D(
+  const std::vector<RtreeImpl::Leaf>& neigh,
+  const std::vector<HitXYZ>& hits,
+  float& d0, float& z0, float& phi0, float& theta, float& qOverP)
 {
-  for (size_t it=0; it<m_tracks.size(); ++it)
+  std::cout<<"!!!!!!!!HoughTrackFinder::helix_fit_3D "<<neigh.size()<<" points"<<std::endl;
+  const size_t n = neigh.size();
+  if (n < 4) return false;
+
+  // ------------------------------
+  // Constants and constraints
+  // ------------------------------
+  const double kBField_T = 1.4;           // Tesla
+  //const double kMinRadius_cm = 0.5;       // min valid circle radius
+  const double kMaxRadius_cm = 140.0;     // max valid radius (~5 m)
+  const double kMaxD0_cm = 5.0;          // max transverse impact
+  const double kMaxZ0_cm = 20.0;         // max z at perigee
+  const double kMinTheta_rad = 0;      // 
+  const double kMaxTheta_rad = 10;      // just below π
+
+  // ------------------------------
+  // 1. Extract hit coordinates
+  // ------------------------------
+  std::vector<float> x(n), y(n), z(n);
+  for (size_t i = 0; i < n; ++i)
   {
-    std::vector<float> xs, ys;
-    xs.reserve(64); ys.reserve(64);
-    const float k = m_tracks[it].slope;
-    const float z0 = m_tracks[it].z0;
-
-    for (size_t ih=0; ih<m_hits.size(); ++ih)
-    {
-      const HitXYZ &h = m_hits[ih];
-      const float r = sqrt(h.x*h.x + h.y*h.y);
-      const float z_pred = k*r + z0;
-      const float dz = fabs(h.z - z_pred);
-      if (dz > _max_z_residual) continue;
-      xs.push_back(h.x); ys.push_back(h.y);
-    }
-    if (xs.size()<3) continue;
-
-    // simple y = a*x + b fit
-    double sx=0,sy=0,sxx=0,sxy=0;
-    int n=(int)xs.size();
-    for (int i=0;i<n;++i){sx+=xs[i];sy+=ys[i];sxx+=xs[i]*xs[i];sxy+=xs[i]*ys[i];}
-    double denom = n*sxx - sx*sx;
-    if (fabs(denom)<1e-8) continue;
-    double a = (n*sxy - sx*sy)/denom;
-    double b = (sy - a*sx)/n;
-    double theta = atan(-1.0/a);
-    double rho = b*sin(theta);
-
-
-
-    if (fabs(m_tracks[it].rho) > RHO_MAX)  m_tracks[it].rho = 0.f;
-if (fabs(m_tracks[it].z0)  > Z0_MAX) m_tracks[it].z0  = 0.f;
-if (fabs(m_tracks[it].rho) > RHO_MAX || fabs(m_tracks[it].z0) > Z0_MAX) continue;
-    m_tracks[it].theta = (float)theta;
-    m_tracks[it].rho   = (float)rho;
-    
+    const HitXYZ& h = hits[neigh[i].second];
+    x[i] = h.x;
+    y[i] = h.y;
+    z[i] = h.z;
+    std::cout<<"Hit "<<i<<" : x = "<<x[i]<<"   y = "<<y[i]<<"   z = "<<z[i]<<std::endl;
   }
-}
 
-
-void HoughTrackFinder::computeStubXYParameters()
-{
-  for (size_t i = 0; i < m_stubs.size(); ++i)
+  // ------------------------------
+  // 2. Circle fit (Kåsa method)
+  // ------------------------------
+  double sum_x = 0, sum_y = 0, sum_x2 = 0, sum_y2 = 0;
+  double sum_xy = 0, sum_x3 = 0, sum_y3 = 0, sum_x1y2 = 0, sum_x2y1 = 0;
+  for (size_t i = 0; i < n; ++i)
   {
-    const Stub &s = m_stubs[i];
-    // collect nearby hits again for this stub
-    std::vector<float> xs, ys;
-    xs.reserve(32); ys.reserve(32);
+    const double xi = x[i];
+    const double yi = y[i];
+    const double xi2 = xi*xi;
+    const double yi2 = yi*yi;
 
-    // For simplicity: just use global hits around z ≈ s.z0 + s.slope * r
-    for (size_t ih = 0; ih < m_hits.size(); ++ih)
-    {
-      const HitXYZ &h = m_hits[ih];
-      const float r = sqrt(h.x*h.x + h.y*h.y);
-      const float z_pred = s.slope * r + s.z0;
-      const float dz = fabs(h.z - z_pred);
-      if (dz > _max_z_residual) continue;
-      xs.push_back(h.x);
-      ys.push_back(h.y);
-    }
-
-    if (xs.size() < 3)
-    {
-      m_stubs[i].rho = 0;
-      m_stubs[i].theta = 0;
-      continue;
-    }
-
-    // Linear regression y = a*x + b
-    double sx = 0, sy = 0, sxx = 0, sxy = 0;
-    int n = (int)xs.size();
-    for (int j = 0; j < n; ++j)
-    {
-      sx += xs[j];
-      sy += ys[j];
-      sxx += xs[j] * xs[j];
-      sxy += xs[j] * ys[j];
-    }
-
-    double denom = n*sxx - sx*sx;
-    if (fabs(denom) < 1e-8) continue;
-
-    double a = (n*sxy - sx*sy) / denom;
-    double b = (sy - a*sx) / n;
-
-    double theta = atan(-1.0/a);
-    double rho   = b * sin(theta);
-if (fabs(rho) > RHO_MAX)
-{
-  m_stubs[i].rho = 9999.f; // mark invalid
-  continue;
-}
-    m_stubs[i].theta = (float)theta;
-    m_stubs[i].rho   = (float)rho;
+    sum_x += xi;
+    sum_y += yi;
+    sum_x2 += xi2;
+    sum_y2 += yi2;
+    sum_xy += xi*yi;
+    sum_x3 += xi2*xi;
+    sum_y3 += yi2*yi;
+    sum_x1y2 += xi*yi2;
+    sum_x2y1 += xi2*yi;
   }
+
+  const double C = n*sum_x2 - sum_x*sum_x;
+  const double D = n*sum_xy - sum_x*sum_y;
+  const double E = n*sum_y2 - sum_y*sum_y;
+  const double G = 0.5*(n*(sum_x3 + sum_x1y2) - (sum_x2 + sum_y2)*sum_x);
+  const double H = 0.5*(n*(sum_y3 + sum_x2y1) - (sum_x2 + sum_y2)*sum_y);
+  const double denom = (C*E - D*D);
+  if (fabs(denom) < 1e-12) return false;
+
+  const double xc = (G*E - D*H)/denom;
+  const double yc = (C*H - D*G)/denom;
+  const double R = std::sqrt((sum_x2 + sum_y2 - 2*xc*sum_x - 2*yc*sum_y)/n + xc*xc + yc*yc);
+std::cout<<"Fitted circle:   xc = "<<xc<<"   yc = "<<yc<<"   R = "<<R<<std::endl;
+if (!std::isfinite(R) || R > kMaxRadius_cm) {
+  return to_straight_perigee(neigh, hits, d0, z0, phi0, theta, qOverP);
 }
+  // ------------------------------
+  // 3. Compute phi0 and d0
+  // ------------------------------
+  const double rc = std::sqrt(xc*xc + yc*yc);
+  phi0 = std::atan2(yc, xc) + M_PI/2.0;
+  d0 = rc - R;
+  if (fabs(d0) > kMaxD0_cm) return false;
+
+  // ------------------------------
+  // 4. Charge sign by rotation sense
+  // ------------------------------
+  double cross = 0;
+  for (size_t i = 1; i < n; ++i)
+    cross += (x[i-1]*y[i] - y[i-1]*x[i]);
+  const int qsign = (cross > 0 ? +1 : -1);
+
+  // ------------------------------
+  // 5. Compute arc lengths s_i along helix
+  // ------------------------------
+  std::vector<double> s(n, 0.0);
+  for (size_t i = 1; i < n; ++i)
+  {
+    double phi_prev = std::atan2(y[i-1]-yc, x[i-1]-xc);
+    double phi_curr = std::atan2(y[i]-yc, x[i]-xc);
+    double dphi = phi_curr - phi_prev;
+    while (dphi > M_PI)  dphi -= 2*M_PI;
+    while (dphi < -M_PI) dphi += 2*M_PI;
+    s[i] = s[i-1] + qsign * R * dphi;
+  }
+
+  // ------------------------------
+  // 6. Linear fit z(s)
+  // ------------------------------
+  double sum_s = 0, sum_s2 = 0, sum_z = 0, sum_sz = 0;
+  for (size_t i = 0; i < n; ++i)
+  {
+    sum_s  += s[i];
+    sum_s2 += s[i]*s[i];
+    sum_z  += z[i];
+    sum_sz += s[i]*z[i];
+  }
+  const double denom2 = (n*sum_s2 - sum_s*sum_s);
+  if (fabs(denom2) < 1e-12) return false;
+
+  const double slope = (n*sum_sz - sum_s*sum_z)/denom2; // tan(lambda)
+  z0 = (sum_z - slope*sum_s)/n;
+  if (fabs(z0) > kMaxZ0_cm) return false;
+
+  const double tan_lambda = slope;
+  theta = std::atan(1.0 / tan_lambda);
+  if (theta < kMinTheta_rad || theta > kMaxTheta_rad || !std::isfinite(theta)) return false;
+
+  // ------------------------------
+  // 7. Compute q/p with cm→m conversion
+  // ------------------------------
+  const double R_m = R * 0.01; // cm → m
+  const double pt = 0.3 * kBField_T * R_m;
+  qOverP = (qsign * 1.0) / std::sqrt(pt*pt + (pt*tan_lambda)*(pt*tan_lambda));
+
+  // ------------------------------
+  // 8. Validity check
+  // ------------------------------
+  if (!std::isfinite(qOverP) || fabs(qOverP) > 10.0) return false;
+
+  return true;
+}
+
+
+
