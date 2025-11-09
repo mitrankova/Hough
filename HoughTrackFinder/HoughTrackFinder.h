@@ -1,132 +1,190 @@
-#ifndef HOUGH_TRACK_FINDER_H
-#define HOUGH_TRACK_FINDER_H
+#ifndef HoughTrackFinder_H
+#define HoughTrackFinder_H
+
+/*!
+ *  \file RHoughTrackFinder.h
+ *  \RTree based hough tracking for cosmics
+ *  \author Christof Roland
+ */
+
+
+//begin
+
+#include "trackreco/PHTrackSeeding.h"
 
 #include <fun4all/SubsysReco.h>
+#include <trackbase/TrkrDefs.h>  // for cluskey
+#include <trackbase/ActsGeometry.h>
+
+
+//TrkrCluster includes
+#include <trackbase/TrkrCluster.h>                      // for TrkrCluster
+#include <trackbase/TrkrDefs.h>                         // for getLayer, clu...
+#include <trackbase/TrkrClusterContainer.h>
+
+#include <fun4all/Fun4AllReturnCodes.h>
+#include <fun4all/SubsysReco.h>                          // for SubsysReco
+
 #include <phool/PHCompositeNode.h>
+#include <phool/PHIODataNode.h>
+#include <phool/PHNode.h>                                // for PHNode
+#include <phool/PHNodeIterator.h>
+#include <phool/PHObject.h>                              // for PHObject
+#include <phool/PHRandomSeed.h>
+#include <phool/PHTimer.h>                               // for PHTimer
+#include <phool/getClass.h>
+#include <phool/phool.h>                                 // for PHWHERE
 
-#include <string>
-#include <vector>
-#include <utility>
-#include <cmath>
+//ROOT includes for debugging
+#include <TFile.h>
+#include <TMatrixDSymfwd.h>                              // for TMatrixDSym
+#include <TMatrixTSym.h>                                 // for TMatrixTSym
+#include <TMatrixTUtils.h>                               // for TMatrixTRow
+#include <TNtuple.h>
+#include <TVector3.h>                                    // for TVector3
+#include <TVectorDfwd.h>                                 // for TVectorD
+#include <TVectorT.h>                                    // for TVectorT
 
-class TFile;
-class TNtuple;
+// gsl
+#include <gsl/gsl_rng.h>
 
-// ------------------------------------------------------------
-// Boost R-tree wrapper
-// ------------------------------------------------------------
+#include <Eigen/Core>
+#include <Eigen/Dense>
+#include <Eigen/LU>
+
+//BOOST for combi seeding
 #include <boost/geometry.hpp>
-#include <boost/geometry/geometries/point.hpp>
 #include <boost/geometry/geometries/box.hpp>
+#include <boost/geometry/geometries/point.hpp>
 #include <boost/geometry/index/rtree.hpp>
 
-namespace bg  = boost::geometry;
+
+// standard includes
+#include <algorithm>
+#include <cassert>                                      // for assert
+#include <cfloat>
+#include <climits>                                      // for UINT_MAX
+#include <cmath>
+#include <cstdlib>                                      // for NULL, exit
+#include <fstream>
+#include <iostream>
+#include <iterator>                                      // for back_insert_...
+#include <map>
+#include <memory>
+#include <string>                      // for string
+#include <tuple>
+#include <vector>
+
+class TGeoManager;
+
+
+#define LogDebug(exp) std::cout << "DEBUG: " << __FILE__ << ": " << __LINE__ << ": " << exp
+#define LogError(exp) std::cout << "ERROR: " << __FILE__ << ": " << __LINE__ << ": " << exp
+#define LogWarning(exp) std::cout << "WARNING: " << __FILE__ << ": " << __LINE__ << ": " << exp
+
+
+using namespace Eigen;
+using namespace std;
+namespace bg = boost::geometry;
 namespace bgi = boost::geometry::index;
+//end
 
-struct RtreeImpl
-{
-  typedef bg::model::point<float, 3, bg::cs::cartesian> Point3D;
-  typedef bg::model::box<Point3D> Box3D;
-  typedef std::pair<Point3D, unsigned int> Leaf;
-  bgi::rtree<Leaf, bgi::quadratic<16> > tree;
-};
+// forward declarations
+class PHCompositeNode;
+class PHG4CellContainer;
+class PHG4CylinderGeomContainer;
+class PHG4HitContainer;
+class PHTimer;
+class sPHENIXSeedFinder;
+class SvtxClusterMap;
+class SvtxCluster;
+class SvtxTrackMap;
+class SvtxTrack;
+class SvtxVertexMap;
+class SvtxVertex;
+class TNtuple;
+class TFile;
+class TRKR_CLUSTER;
+class SvtxHitMap;
+class TrackSeedContainer;
 
-// ------------------------------------------------------------
-// Main class
-// ------------------------------------------------------------
+
+namespace bg = boost::geometry;
+namespace bgi = boost::geometry::index;
+typedef bg::model::point<float, 3, bg::cs::cartesian> point;
+typedef bg::model::box<point> box;
+typedef std::pair<point, TrkrDefs::cluskey> pointKey;
+
+typedef uint64_t cluskey;
+
+
+
+
 class HoughTrackFinder : public SubsysReco
 {
-public:
-  explicit HoughTrackFinder(const std::string &name = "HoughTrackFinder",
-                            const std::string &outfile = "hough_output.root");
-  ~HoughTrackFinder() override;
+ public:
+  HoughTrackFinder(const std::string &name = "PHRTreeSeeding");
 
+  double chisq(const double *xx);
+  //vector<TrkrCluster*> clusterpoints;
+  virtual ~HoughTrackFinder()
+  {
+  }
+  void set_write_debug_ntuple(bool b){_write_ntp = b;}
+  void set_create_tracks(bool b){_create_tracks = b;}
+  void set_max_distance_to_origin(float val){ _max_dist_to_origin = val;}
+  void set_min_nclusters(int n){ _min_nclusters = n;}
+
+ protected:
+  int Setup(PHCompositeNode *topNode);
+  int GetNodes(PHCompositeNode* topNode);
   int Init(PHCompositeNode *topNode) override;
+  int InitRun(PHCompositeNode *topNode) override;
   int process_event(PHCompositeNode *topNode) override;
   int End(PHCompositeNode *topNode) override;
 
 
-void set_knn_neighbors(unsigned int k) { _knn = k; }
-  // ----------------------------------------------
-  // Data structures (must be public for extern use)
-  // ----------------------------------------------
-  struct HitXYZ
-  {
-    float x;
-    float y;
-    float z;
-  };
+ private:
+  /// fetch node pointers
+  // int GetNodes(PHCompositeNode *topNode);
 
-  struct Stub
-  {
-    float d0, z0, phi0, theta, qOverP;
-    int   npoints;
-    float slope;
-    float rho;
-  };
+   //static vector<tuple<double, double, double>> clusterpoints;
+   /*static*/ //vector<TrkrCluster*> clusterpoints;
 
-  struct Track
-  {
-    float slope, z0, rho, theta;
-    int   nhits;
-  };
+  // node pointers
+  TrkrClusterContainer *_cluster_map = nullptr;
+  //nodes to get norm vector
 
-private:
-  // ---------- Internal helpers ----------
-  int  collectHits(PHCompositeNode *topNode);
-  void buildRtree();
-  void fitLocalStubs();
+  double phiadd(double phi1, double phi2);
+  double phidiff(double phi1, double phi2);
+  double pointKeyToTuple(pointKey *pK);
+  double costfunction(const double *xx);
+  //double chisq(const double *xx);
+  void get_stub(const bgi::rtree<pointKey, bgi::quadratic<16>> &rtree, float pointx, float pointy, int &count, double &slope, double &intercept);
+  ActsGeometry *tGeometry{nullptr};
+#ifndef __CINT__
+ private:
+  int createNodes(PHCompositeNode *topNode);
+  std::string m_trackMapName = "TpcTrackSeedContainer";
+  TrackSeedContainer *m_seedContainer = nullptr;
 
-  // 3D helix fit
-  bool helix_fit_3D(const std::vector<RtreeImpl::Leaf> &neigh,
-                    const std::vector<HitXYZ> &hits,
-                    float &d0, float &z0, float &phi0,
-                    float &theta, float &qOverP);
+  //int _nlayers_all;
+  //unsigned int _nlayers_seeding;
+  //std::vector<int> _seeding_layer;
 
-  // fallback straight-line fit
-  bool to_straight_perigee(const std::vector<RtreeImpl::Leaf> &neigh,
-                           const std::vector<HitXYZ> &hits,
-                           float &d0, float &z0, float &phi0,
-                           float &theta, float &qOverP);
-  void fit_straight_line_xyz( const std::vector<RtreeImpl::Leaf>& neigh,
-                            const std::vector<HitXYZ>& hits,
-                            double& r0x, double& r0y, double& r0z,
-                            double& vx,  double& vy,  double& vz);
+  unsigned int _nevent = 0;
+  bool _write_ntp = true;
+  bool _create_tracks = true;
+  float _max_dist_to_origin = 0;
+  unsigned int _min_nclusters = 20;
+  TNtuple *_ntp_cos = nullptr;
+  TNtuple *_ntp_stub = nullptr;
+  TNtuple *_ntp_max = nullptr;
+  TFile *_tfile = nullptr;
+  //std::vector<float> _radii_all;
 
-  // Optional stubs
-  void computeStubXYParameters() {}
-  void assignHitsToTracks() {}
-  void computeXYParameters() {}
 
-  // ---------- Configuration ----------
-  unsigned int _min_layer;
-  unsigned int _max_layer;
-  unsigned int _knn;
-  float _stub_window_r;
-  float _stub_window_phi;
-  float _stub_window_z;
-  float _max_z_residual;
-  unsigned int _min_stubs;
-  unsigned int _min_hits;
-  float _slope_bin;
-  float _z0_bin;
-  unsigned int _max_tracks;
-
-  // ---------- Output ----------
-  std::string m_outputFileName;
-  TFile* m_outputFile;
-  TNtuple* _ntp_hits;
-  TNtuple* _ntp_stubs;
-  TNtuple* _ntp_tracks;
-
-  unsigned int _nevent;
-
-  // ---------- Storage ----------
-  std::vector<HitXYZ> m_hits;
-  std::vector<Stub> m_stubs;
-  std::vector<Track> m_tracks;
-
-  RtreeImpl* _rtree;
+#endif  // __CINT__
 };
 
-#endif  // HOUGH_TRACK_FINDER_H
+#endif

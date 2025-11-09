@@ -1,523 +1,613 @@
-//============================================================
-// HoughTrackFinder.cc — 3D straight-line Hough (r,φ,z)
-// Optimized: k-NN local stubs + grid clustering in (k,z0)
-// Extended: Extract (rho, theta) in XY plane
-//============================================================
+/*!
+ *  \file HoughTrackFinder.cc
+ 
+ *  \author Christof Roland 
+ */
+
+//begin
 
 #include "HoughTrackFinder.h"
 
-#include <trackbase/TrkrHitSetContainer.h>
-#include <trackbase/TrkrHitSet.h>
-#include <trackbase/TrkrHit.h>
-#include <trackbase/TrkrDefs.h>
-#include <trackbase/TpcDefs.h>
-#include <trackbase/ActsGeometry.h>
-#include <g4detectors/PHG4TpcGeomContainer.h>
-#include <g4detectors/PHG4TpcGeom.h>
+//#include "AssocInfoContainer.h"                         // for AssocInfoCont...
 
+// sPHENIX Geant4 includes
+#include <g4detectors/PHG4CylinderCellGeom.h>
+#include <g4detectors/PHG4CylinderCellGeomContainer.h>
+#include <g4detectors/PHG4CylinderGeom.h>
+#include <g4detectors/PHG4CylinderGeomContainer.h>
+
+#include <trackbase/TrackFitUtils.h>
+#include <trackbase/TrkrCluster.h>
+#include <trackbase/TrkrClusterContainer.h>
+#include <trackbase/TrkrClusterHitAssoc.h>
+#include <trackbase/TrkrClusterIterationMapv1.h>
+#include <trackbase/TrkrDefs.h>  // for getLayer, clu...
+
+#include <trackbase_historic/TrackSeed.h>
+#include <trackbase_historic/TrackSeedContainer.h>
+#include <trackbase_historic/TrackSeedContainer_v1.h>
+#include <trackbase_historic/TrackSeed_v2.h>
+
+// sPHENIX includes
 #include <fun4all/Fun4AllReturnCodes.h>
+#include <fun4all/SubsysReco.h>
+
+#include <phool/PHTimer.h>                              // for PHTimer
 #include <phool/getClass.h>
-#include <phool/PHCompositeNode.h>
 
+//ROOT includes for debugging
 #include <TFile.h>
+#include <TH1.h>
 #include <TNtuple.h>
+#include <TAxis.h>
+#include <TGraph.h>
 
-#include <cmath>
-#include <algorithm>
-#include <map>
-#include <set>
-#include <iostream>
+#include <Eigen/Core>                  // for Matrix
+#include <Eigen/Dense>
 
-#ifdef _OPENMP
-  #include <omp.h>
-#endif
-
-// Boost geometry/index (R-tree)
-/*#include <boost/geometry.hpp>
-#include <boost/geometry/geometries/point.hpp>
+//BOOST for combi seeding
+#include <boost/geometry.hpp>
 #include <boost/geometry/geometries/box.hpp>
+#include <boost/geometry/geometries/point.hpp>
 #include <boost/geometry/index/rtree.hpp>
 
-using std::sqrt;
-namespace bg  = boost::geometry;
-namespace bgi = boost::geometry::index;
-*/
+// standard includes
+#include <algorithm>
+#include <cfloat>
+#include <climits>                                     // for UINT_MAX
+#include <cmath>
+#include <iostream>
+#include <list>
+#include <map>
+#include <memory>
+#include <memory>
+#include <set>                                          // for set
+#include <string>                                  // for string
+#include <tuple>
+#include <utility>
+#include <vector>
+                                   // for pair, make_pair
+
+// forward declarations
+class BbcVertexMap;
+
+class PHCompositeNode;
+
+class PHG4CellContainer;
+class PHG4CylinderGeomContainer;
+class PHG4Particle;
+class PHG4TruthInfoContainer;
+class PHTimer;
+
+class sPHENIXSeedFinder;
+
+class SvtxClusterMap;
+class SvtxCluster;
+class SvtxTrackMap;
+class SvtxTrack;
+class SvtxTrackState;
+class SvtxVertexMap;
+class SvtxHitMap;
+
+class TNtuple;
+class TFile;
 
 
-// ----------------- Private impl for the R-tree -----------------
-/*struct RtreeImpl
-{
-  typedef bg::model::point<float, 3, bg::cs::cartesian> Point3D;
-  typedef bg::model::box<Point3D> Box3D;
-  typedef std::pair<Point3D, unsigned int> Leaf; // (x,y,z) with index
-  typedef bgi::rtree< Leaf, bgi::quadratic<16> > RTree;
-  RTree tree;
-};*/
+using point = bg::model::point<float, 3, bg::cs::cartesian>;
+//typedef bg::model::point<float, 3, bg::cs::cartesian> point;
+using box = bg::model::box<point>;
+//typedef bg::model::box<point> box;
+using pointKey = std::pair<point, TrkrDefs::cluskey>;
+//typedef std::pair<point, TrkrDefs::cluskey> pointKey;
 
-//============================================================
-// ctor/dtor
-//============================================================
-HoughTrackFinder::HoughTrackFinder(const std::string &name,
-                                   const std::string &outfile)
+using myrtree = bgi::rtree<pointKey, bgi::quadratic<16>>;
+
+
+#define LogDebug(exp) std::cout << "DEBUG: " << __FILE__ << ": " << __LINE__ << ": " << exp
+#define LogError(exp) std::cout << "ERROR: " << __FILE__ << ": " << __LINE__ << ": " << exp
+#define LogWarning(exp) std::cout << "WARNING: " << __FILE__ << ": " << __LINE__ << ": " << exp
+
+
+using namespace std;
+
+vector<TrkrCluster*> clusterpoints;
+
+HoughTrackFinder::HoughTrackFinder(const std::string& name)
   : SubsysReco(name)
-  , _min_layer(7)
-  , _max_layer(55)
-  , _knn(15)
-  , _stub_window_r(3)
-  , _stub_window_phi(0.0053073*8)
-  , _stub_window_z(3)
-  , _max_z_residual(3.0)
-  , _min_stubs(6)
-  , _min_hits(20)
-  , _slope_bin(0.02f)
-  , _z0_bin(2.0f)
-  , _max_tracks(16)
-  , m_outputFileName(outfile)
-  , m_outputFile(0)
-  , _ntp_hits(0)
-  , _ntp_stubs(0)
-  , _nevent(0)
-  , _rtree(0)
 {
-}
-
-HoughTrackFinder::~HoughTrackFinder()
-{
-  if (_rtree) { delete _rtree; _rtree = 0; }
-}
-
-//============================================================
-// Init
-//============================================================
-int HoughTrackFinder::Init(PHCompositeNode * /*topNode*/)
-{
-  m_outputFile = new TFile(m_outputFileName.c_str(), "RECREATE");
-  if (!m_outputFile || m_outputFile->IsZombie())
-  {
-    std::cerr << "HoughTrackFinder::Init - cannot create " << m_outputFileName << std::endl;
-    return Fun4AllReturnCodes::ABORTRUN;
-  }
-
-  _ntp_hits   = new TNtuple("hits",   "hits",   "event:x:y:z");
-  _ntp_stubs  = new TNtuple("stubs",  "stubs",  "event:d0:z0:phi0:theta:qOverP:npts");
-
-
-  return Fun4AllReturnCodes::EVENT_OK;
-}
-
-//============================================================
-// process_event
-//============================================================
-int HoughTrackFinder::process_event(PHCompositeNode *topNode)
-{
-  m_hits.clear();
-  m_stubs.clear();
-
-  if (_rtree) { delete _rtree; _rtree = 0; }
-
-  int ret = collectHits(topNode);
-  if (ret != Fun4AllReturnCodes::EVENT_OK) return ret;
-  if (m_hits.size() < 20) { _nevent++; return Fun4AllReturnCodes::EVENT_OK; }
-
-  buildRtree();
-  fitLocalStubs();
-
-  if (m_stubs.empty()) { _nevent++; return Fun4AllReturnCodes::EVENT_OK; }
-
- // clusterStubs();
-//  if (m_tracks.empty()) { _nevent++; return Fun4AllReturnCodes::EVENT_OK; }
-
-
-
-if (_ntp_stubs)
-{
-  for (size_t i = 0; i < m_stubs.size(); ++i)
-  {
-    const Stub &s = m_stubs[i];
-    _ntp_stubs->Fill((float)_nevent,
-                     s.d0,
-                     s.z0,
-                     s.phi0,
-                     s.theta,
-                     s.qOverP,
-                     (float)s.npoints);
-  }
-}
-
-
   
-  _nevent++;
-  return Fun4AllReturnCodes::EVENT_OK;
 }
 
-//============================================================
-// End
-//============================================================
-int HoughTrackFinder::End(PHCompositeNode * /*topNode*/)
+int HoughTrackFinder::GetNodes(PHCompositeNode* topNode)
 {
-  if (m_outputFile)
+  tGeometry = findNode::getClass<ActsGeometry>(topNode, "ActsGeometry");
+  if (!tGeometry)
   {
-    m_outputFile->cd();
-    if (_ntp_hits)   _ntp_hits->Write();
-    if (_ntp_stubs)  _ntp_stubs->Write();
-    m_outputFile->Close();
-    delete m_outputFile; m_outputFile = 0;
+    std::cout << PHWHERE << "No acts reco geometry, bailing."
+              << std::endl;
+    return Fun4AllReturnCodes::ABORTEVENT;
   }
-  if (_rtree) { delete _rtree; _rtree = 0; }
+  _cluster_map = findNode::getClass<TrkrClusterContainer>(topNode, "TRKR_CLUSTER");
+  if (!_cluster_map)
+  {
+    std::cout << PHWHERE << "No cluster container on node tree, bailing."
+              << std::endl;
+    return Fun4AllReturnCodes::ABORTEVENT;
+  }
   return Fun4AllReturnCodes::EVENT_OK;
 }
 
-//============================================================
-// Helpers
-//============================================================
-
-int HoughTrackFinder::collectHits(PHCompositeNode *topNode)
+//____________________________________________________________________________..
+int HoughTrackFinder::Init(PHCompositeNode* topNode)
 {
-  TrkrHitSetContainer *hitmap = findNode::getClass<TrkrHitSetContainer>(topNode, "TRKR_HITSET");
-  PHG4TpcGeomContainer *tpcGeom = findNode::getClass<PHG4TpcGeomContainer>(topNode, "TPCGEOMCONTAINER");
-  ActsGeometry *geometry = findNode::getClass<ActsGeometry>(topNode, "ActsGeometry");
-  if (!hitmap || !tpcGeom || !geometry) return Fun4AllReturnCodes::ABORTEVENT;
+  if(topNode==nullptr){
+    std::cout << PHWHERE << "No topNode, bailing."
+	      << std::endl;
+    return Fun4AllReturnCodes::ABORTEVENT;
+  }
+  _nevent = 0;
+  if(_write_ntp){
+  _tfile = new TFile("./costuple.root", "RECREATE");
+  _ntp_cos = new TNtuple("ntp_cos", "cos event info","ev:x:y");
+  _ntp_stub = new TNtuple("ntp_stub", "cos stub info","ev:int:sl:tan:x0");
+  _ntp_max = new TNtuple("ntp_max", "cos stub info","ev:intmin:intmax:slmin:slmax");
+  }
+  return Fun4AllReturnCodes::EVENT_OK;
+}
 
-  TrkrHitSetContainer::ConstRange allsets = hitmap->getHitSets();
-  for (TrkrHitSetContainer::ConstIterator itset = allsets.first; itset != allsets.second; ++itset)
+//____________________________________________________________________________..
+int HoughTrackFinder::InitRun(PHCompositeNode* topNode)
+{
+  int ret = GetNodes(topNode);
+  if (ret != Fun4AllReturnCodes::EVENT_OK)
   {
-    TrkrDefs::hitsetkey hitsetkey = itset->first;
-    TrkrHitSet *hitset = itset->second;
-    if (TrkrDefs::getTrkrId(hitsetkey) != TrkrDefs::tpcId) continue;
+    return ret;
+  }
+  ret = createNodes(topNode);
 
-    unsigned int layer = TrkrDefs::getLayer(hitsetkey);
-    if (layer < _min_layer || layer > _max_layer) continue;
 
-    unsigned int side  = TpcDefs::getSide(hitsetkey);
-    PHG4TpcGeom *geoLayer = tpcGeom->GetLayerCellGeom(layer);
-    if (!geoLayer) continue;
+  return ret;
+}
+int HoughTrackFinder::createNodes(PHCompositeNode* topNode)
+{
+  PHNodeIterator iter(topNode);
 
-    double radius = geoLayer->get_radius();
-    float AdcClockPeriod = geoLayer->get_zstep();
+  PHCompositeNode* dstNode = dynamic_cast<PHCompositeNode*>(iter.findFirst("PHCompositeNode", "DST"));
 
-    TrkrHitSet::ConstRange range = hitset->getHits();
-    for (TrkrHitSet::ConstIterator hitr = range.first; hitr != range.second; ++hitr)
-    {
-      TrkrDefs::hitkey hitkey = hitr->first;
-      auto *hit = hitr->second;
-      int m_adc = hit->getAdc();
-      if (m_adc < 40) continue; // adc cut
-      unsigned int pad = TpcDefs::getPad(hitkey);
-      double phi = geoLayer->get_phicenter(pad, side);
-      Acts::Vector3 glob = geometry->getGlobalPositionTpc(hitsetkey, hitkey, phi, radius, AdcClockPeriod);
+  if (!dstNode)
+  {
+    std::cerr << "DST node is missing, quitting" << std::endl;
+    throw std::runtime_error("Failed to find DST node in HoughTrackFinder::createNodes");
+  }
 
-      HitXYZ h;
-      h.x = (float)glob.x();
-      h.y = (float)glob.y();
-      h.z = (float)glob.z();
-      m_hits.push_back(h);
+  PHNodeIterator dstIter(dstNode);
+  PHCompositeNode* svtxNode = dynamic_cast<PHCompositeNode*>(dstIter.findFirst("PHCompositeNode", "SVTX"));
 
-      if (_ntp_hits) _ntp_hits->Fill((float)_nevent, h.x, h.y, h.z);
+  if (!svtxNode)
+  {
+    svtxNode = new PHCompositeNode("SVTX");
+    dstNode->addNode(svtxNode);
+  }
+
+  m_seedContainer = findNode::getClass<TrackSeedContainer>(topNode, m_trackMapName);
+  if (!m_seedContainer)
+  {
+    m_seedContainer = new TrackSeedContainer_v1;
+    PHIODataNode<PHObject>* trackNode =
+        new PHIODataNode<PHObject>(m_seedContainer, m_trackMapName, "PHObject");
+    svtxNode->addNode(trackNode);
+  }
+  if (m_seedContainer){
+    cout << "SEED CONTAINER CREATED" << endl;
+  }
+  return Fun4AllReturnCodes::EVENT_OK;
+}
+
+double HoughTrackFinder::phiadd(double phi1, double phi2){
+  double s = phi1+phi2;
+  if(s>2*M_PI) {return s-2*M_PI;}
+  else if(s<0) {return s+2*M_PI;}
+  else {return s;}
+}
+
+
+double HoughTrackFinder::phidiff(double phi1, double phi2){
+  double d = phi1-phi2;
+  if(d>M_PI) {return d-2*M_PI;}
+  else if(d<-M_PI) {return d+2*M_PI;}
+  else {return d;}
+}
+
+void HoughTrackFinder::get_stub(const myrtree &search_rtree, float pointx, float pointy, int &count, double &slope, double &intercept){ //NOLINT
+  float m1_dx = 4;
+  float m1_dy = 4;
+  vector<pointKey> boxclusters;
+  search_rtree.query(bgi::intersects(box(point(pointx-m1_dx,pointy-m1_dy,-1),
+				  point(pointx+m1_dx,pointy+m1_dy,1))),std::back_inserter(boxclusters));
+  
+  int nbox = boxclusters.size();
+  
+  int nhit = 0;
+  double xsum = 0;
+  double x2sum = 0;
+  double ysum = 0;
+  double xysum = 0;
+  if(nbox>=2){
+    for(vector<pointKey>::iterator pbox = boxclusters.begin();pbox!=boxclusters.end();++pbox){
+      float boxx = pbox->first.get<0>();
+      float boxy = pbox->first.get<1>();
+      //      std::cout << "fprobe: " << count << " x:"  << boxx << " y: " << boxy << std::endl;
+      nhit++;
+      float r = boxx;
+      float z = boxy;
+      xsum = xsum + r;            // calculate sigma(xi)
+      ysum = ysum + z;            // calculate sigma(yi)
+      x2sum = x2sum + r*r;  // calculate sigma(x^2i)
+      xysum = xysum + r * z;      // calculate sigma(xi*yi)
+    }
+  }
+  
+  const double denominator = ((x2sum * nhit) - (xsum*xsum));
+  slope = (xysum * nhit - xsum * ysum) / denominator;   // calculate slope
+  intercept = (x2sum * ysum - xsum * xysum) / denominator;  // calculate intercept
+  count = nhit;
+}
+
+int HoughTrackFinder::process_event(PHCompositeNode* topNode)
+{
+  if(topNode==nullptr){
+    std::cout << PHWHERE << "No topNode, bailing."
+	      << std::endl;
+    return Fun4AllReturnCodes::ABORTEVENT;
+  }
+    
+  _nevent++;
+  std::vector<TrackSeed_v2> clean_chains;
+  //Fill rtree
+  bgi::rtree<pointKey, bgi::quadratic<16> > rtree;
+
+  float slmin =  99999999999.9;
+  float slmax = -99999999999.9;
+  float intmin = 99999999999.9;
+  float intmax =-99999999999.9;
+//  int num = 0;
+  //  for(const auto& hitsetkey:_cluster_map->getHitSetKeys(TrkrDefs::TrkrId::tpcId)){
+  if(_cluster_map->size()<_min_nclusters){
+    std::cout << " not enough clusters in event: " << _cluster_map->size() << " < " << _min_nclusters << endl;
+    return Fun4AllReturnCodes::ABORTEVENT;
+  }
+  for(const auto& hitsetkey:_cluster_map->getHitSetKeys(TrkrDefs::TrkrId::tpcId)){
+  //  for(const auto& hitsetkey:_cluster_map->getHitSetKeys()){
+    auto range = _cluster_map->getClusters(hitsetkey);
+    for( auto clusIter = range.first; clusIter != range.second; ++clusIter ){
+      TrkrDefs::cluskey ckey = clusIter->first;
+      TrkrCluster *cluster = clusIter->second;
+      //      unsigned int layer = TrkrDefs::getLayer(ckey);
+      /* if (layer < 7 || layer >= 55){
+	if(Verbosity()>0) std::cout << "layer: " << layer << std::endl;
+	continue;
+	}*/
+      // get global position, convert to Acts::Vector3 and store in map
+      const Acts::Vector3 globalpos_d =  tGeometry->getGlobalPosition(ckey, cluster);
+      
+      const Acts::Vector3 globalpos = { globalpos_d.x(), globalpos_d.y(), globalpos_d.z()};
+      //      if(layer>=51&&layer<=55)
+//      num++;
+      //      std::cout << "#: " << num << " l xyz " << layer << " | " << globalpos_d.x() << " | " << globalpos_d.y() << " | " <<  globalpos_d.z() <<std::endl;
+      if(_write_ntp)_ntp_cos->Fill(_nevent,globalpos_d.x(), globalpos_d.y());
+      /*
+      const double clus_phi = get_phi( globalpos );      
+      const double clus_eta = get_eta( globalpos );
+      const double clus_l = layer;  
+      */
+
+      std::vector<pointKey> testduplicate;
+      rtree.query(bgi::intersects(box(point(globalpos_d.x()-0.001,globalpos_d.y()-0.001,-1),
+				      point(globalpos_d.x()+0.001,globalpos_d.y()+0.001,1))),std::back_inserter(testduplicate));
+      if (!testduplicate.empty()){
+	continue;
+      }
+
+      rtree.insert(std::make_pair(point(globalpos.x() , globalpos.y(), 0.0), ckey));
+      
     }
   }
 
-  return Fun4AllReturnCodes::EVENT_OK;
-}
+  //Get all clusters from rtree, fit stubs around clusters, fill stub tree
+  vector<pointKey> allclusters;
+  
+  rtree.query(bgi::intersects(box(point(-80,-80,-1),point(80,80,1))),std::back_inserter(allclusters));
+  if(Verbosity()>0) cout << "number clus is " << allclusters.size() << endl;
 
-void HoughTrackFinder::buildRtree()
-{
-  if (_rtree) { delete _rtree; _rtree = 0; }
-  _rtree = new RtreeImpl;
-  for (unsigned int i = 0; i < m_hits.size(); ++i)
-  {
-    const HitXYZ &h = m_hits[i];
-    RtreeImpl::Point3D p(h.x, h.y, h.z);
-    _rtree->tree.insert(std::make_pair(p, i));
+  bgi::rtree<pointKey, bgi::quadratic<16> > rtree_stub;
+
+  for(vector<pointKey>::iterator cluster = allclusters.begin();cluster!=allclusters.end();++cluster){
+    float pointx = cluster->first.get<0>();
+    float pointy = cluster->first.get<1>();
+    int fcount = 0;
+    double fslope = 0;
+    double fintercept = 0;
+    //calc slope and intersect from 5 cluster stubs
+    get_stub(rtree, pointx, pointy, fcount, fslope, fintercept);
+    if(finite(fslope))
+    {
+        rtree_stub.insert(std::make_pair(point(fintercept , fslope, 0.0), 0));
+        float tana = atan(fslope);
+        if(_write_ntp)_ntp_stub->Fill(_nevent,fintercept,fslope,tana,fintercept);
+        if(fslope>slmax)slmax = fslope;
+        if(fslope<slmin)slmin = fslope;
+        if(fintercept>intmax)intmax = fintercept;
+        if(fintercept<intmin)intmin = fintercept;
+    }
   }
-}
 
 
+  
+  //  int out = 0;
+  // find clusters of slope intectept pairs
+  map <int,pair<float,float>> outtrkmap;
+  int nout = 0;
 
-void HoughTrackFinder::fitLocalStubs()
-{
-  if (!_rtree) return;
-  m_stubs.clear();
-  m_stubs.reserve(m_hits.size());
-
-  const unsigned int N = (unsigned int)m_hits.size();
-  std::vector< std::vector<Stub> > thread_stubs;
-  unsigned int nthreads=1;
-//#ifdef _OPENMP
-//  nthreads = (unsigned int)omp_get_max_threads();
-//#endif
-  thread_stubs.resize(nthreads);
-
-//#ifdef _OPENMP
-//#pragma omp parallel for schedule(dynamic)
-//#endif
-  for (int i=0;i<(int)N;++i)
+  while(rtree_stub.size()>10)
   {
-    const HitXYZ &h = m_hits[(unsigned int)i];
-    std::vector<RtreeImpl::Leaf> neigh;
-    neigh.reserve(_knn ? _knn : 32);
+    std::vector<pointKey> allstubs;
+    rtree_stub.query(bgi::intersects(box(point(intmin,slmin,-1),point(intmax,slmax,1))),std::back_inserter(allstubs));
+    map <int,pair<float,float>> trkmap;
 
-    if (_knn > 0)
-      _rtree->tree.query(bgi::nearest(RtreeImpl::Point3D(h.x,h.y,h.z),(int)_knn),std::back_inserter(neigh));
+    float int_width = (intmax - intmin)/20;
+    float sl_width = (slmax - slmin)/20;
+
+    for(vector<pointKey>::iterator stub = allstubs.begin();stub!=allstubs.end();++stub)
+    {
+      float pint = stub->first.get<0>();
+      float psl = stub->first.get<1>();
+      vector<pointKey> trkcand;
+      
+      rtree_stub.query(bgi::intersects(box(point(pint-int_width,psl-sl_width,-1),point(pint+int_width,psl+sl_width,1))),std::back_inserter(trkcand));
+      
+      int ntrk = trkcand.size();
+      int count = 0;
+      float intsum = 0;
+      float slsum = 0;
+      if(ntrk>=5)
+      {
+          for(vector<pointKey>::iterator ptrk = trkcand.begin();ptrk!=trkcand.end();++ptrk)
+          {
+            float trkint = ptrk->first.get<0>();
+            float trksl = ptrk->first.get<1>();
+            if(Verbosity()>0) cout<< "    stub " << ntrk
+                << " int: " << trkint 
+                << " sl: "  << trksl 
+                << endl;
+            
+            intsum = intsum + trkint;            // calculate sigma(xi)
+            slsum = slsum + trksl;            // calculate sigma(yi)
+            count++;
+          }
+          float mint = (intsum/count);
+          float msl  = (slsum/count);
+          trkmap[ntrk] = std::make_pair(mint,msl); 
+              
+          if(Verbosity()>0) cout<< " stub in box " << ntrk
+                    << " int: " << pint 
+                    << " sl: " << psl 
+                    << " intwi: " << int_width 
+                    << " slwi: " << sl_width
+                    << " mint " << mint
+                    << " msl " << msl
+                    << endl;
+      }
+    }
+    
+    if( trkmap.size()>0)
+    {
+      int size_before = rtree_stub.size();
+      if(Verbosity()>0) cout << "mapend: " << trkmap.rbegin()->first << " | " << (trkmap.rbegin()->second).first << " | "  << trkmap.rbegin()->second.second << endl;
+      // for (const auto& [key, value] : trkmap)
+      //	std::cout <<" ev: " << _nevent << '[' << key << "] = " << value.first << " | " << value.second << std::endl;
+      //remove stubs in box
+      float rmint = trkmap.rbegin()->second.first;
+      float rmsl = trkmap.rbegin()->second.second;
+      vector<pointKey> rmcand;
+      rtree_stub.query(bgi::intersects(box(point(rmint-int_width,rmsl-sl_width,-1),point(rmint+int_width,rmsl+sl_width,1))),std::back_inserter(rmcand));
+
+      for(vector<pointKey>::iterator rmstub = rmcand.begin();rmstub!=rmcand.end();++rmstub)
+      {
+          float rmpint = rmstub->first.get<0>();
+          float rmpsl = rmstub->first.get<1>();
+          if(Verbosity()>0) cout<< "    rm " <<  " int: " << rmpint 
+                << " sl: " << rmpsl 
+                << endl;
+
+            //auto rmpoint = std::make_pair(point(rmpint , rmpsl, 0.0), 0);
+            //rtree_stub.remove(rmpoint);
+            //	pointKey match;
+            rtree_stub.remove(*rmstub);
+            /*	if (!rtree_stub.query(bgi::nearest(rmpoint, 1), &match))
+              continue;
+            */
+            /*
+            if (bg::distance(rmpoint, match.first) <= 0.5) {
+              rtree_stub.remove(match);
+            
+              */
+      }
+      int size_after = rtree_stub.size();
+      if(size_before == size_after) {break;}
+      outtrkmap[nout++] = std::make_pair(rmint,rmsl);
+      cout << " tree sixe after remove: " << rtree_stub.size() << endl;
+    }
     else
     {
-      float rwin = _stub_window_r;
-      float phiwin = _stub_window_phi;
-      float zwin = _stub_window_z;
-
-      float r   = sqrt(h.x*h.x + h.y*h.y);
-      float phi = atan2(h.y, h.x);
-      float dx = fabs(cos(phi) * rwin) + fabs(r * sin(phi) * phiwin);
-      float dy = fabs(sin(phi) * rwin) + fabs(r * cos(phi) * phiwin);
-      float dz = zwin;
-          std::cout<<"Box for hit "<<i<<" : "<<h.x - dx<<" "<<h.y - dy<<" "<<h.z - dz<<" to "
-                    <<h.x + dx<<" "<<h.y + dy<<" "<<h.z + dz<<"    point "<<h.x<<" "<<h.y<<" "<<h.z<<"    delta "<<dx<<" "<<dy<<" "<<dz<<std::endl;
-      RtreeImpl::Box3D box(
-          RtreeImpl::Point3D(h.x - dx, h.y - dy, h.z - dz),
-          RtreeImpl::Point3D(h.x + dx, h.y + dy, h.z + dz));
-
-      _rtree->tree.query(bgi::intersects(box),std::back_inserter(neigh));
+      break;
     }
-    std::cout<<"Found "<<neigh.size()<<" neighbors for hit "<<i<<std::endl;
-    if (neigh.size()<3) continue;
-
-
-float d0=0, z0=0, phi0=0, theta=0, qOverP=0;
-if (!helix_fit_3D(neigh, m_hits, d0, z0, phi0, theta, qOverP)) continue;
-
-
-//#ifdef _OPENMP
-//    unsigned int tid=(unsigned int)omp_get_thread_num();
-//#else
-    unsigned int tid=0;
-//#endif
-    Stub s; 
-    s.d0 = d0;
-    s.z0 = z0;
-    s.phi0 = phi0;
-    s.theta = theta;
-    s.qOverP = qOverP;
-    s.npoints = (int)neigh.size();
-
-    thread_stubs[tid].push_back(s);
+    trkmap.clear();
   }
 
-  for (unsigned int t=0;t<thread_stubs.size();++t)
-    m_stubs.insert(m_stubs.end(),thread_stubs[t].begin(),thread_stubs[t].end());
-
- /* if (_ntp_stubs)
+  int numberofseeds = 0;
+  bool keep_event = false;
+  for (const auto& [key, value] : outtrkmap)
   {
-    for (size_t i=0;i<m_stubs.size();++i)
-        _ntp_stubs->Fill((float)_nevent, d0, z0, phi0, theta, qOverP, (float)npoints);
-  }*/
-}
+      if(Verbosity()>0) std::cout <<" out ev: " << _nevent << '[' << key << "] = " << value.first << " | " << value.second << std::endl;
+      //Loop over clusters and pick up clusters compatible with line parameters
 
+      float tint = -1*value.first;
+      float tsl = -1*value.second;
+      
+      //  float liney = tsl*ptx + tint;
+      
+      // double ry = pty;
+      // double zx = ptx;
+      
+      // The shortest distance of a point from a circle is along the radial; line from the circle center to the point
+      
+      double a = -tsl;//-slope;
+      double b = -1.0;
+      double c = -tint;//-intercept;
+      double r = 100;
+      double x0 = -a*c/(a*a+b*b), y0 = -b*c/(a*a+b*b);
+      double ax = NAN, ay = NAN, bx = NAN, by = NAN;
+      if ((c*c) > (r*r*(a*a+b*b)+0.00000001))
+      {
+        if(Verbosity()>0) cout << "no points " << endl;
+      }
+      else if (abs (c*c - r*r*(a*a+b*b)) < 0.0000001) 
+      {
+      if(Verbosity()>0)
+      { 
+          puts ("1 point");
+          cout << x0 << ' ' << y0 << endl;
+      }
+      }
+      else 
+      {
+          double d = r*r - c*c/(a*a+b*b);
+          double mult = sqrt (d / (a*a+b*b));
+          ax = x0 + b * mult;
+          bx = x0 - b * mult;
+          ay = y0 - a * mult;
+          by = y0 + a * mult;
+          if(Verbosity()>0){
+              puts ("2 points");
+              cout << ax << ' ' << ay << '\n' << bx << ' ' << by << endl;
+          }
+      }
+      float dist = 4;
+      float alpha = atan(tsl);
+      float offax = -1*dist*sin(alpha);
+      float offay = -1*dist*cos(alpha);
+      float offbx = 1*dist*sin(alpha);
+      float offby = 1*dist*cos(alpha);
+      vector<pointKey> trkclusters;
+      
+      //float trkdist = 4;
+      vector<pointKey> lineclusters;
+      if(Verbosity()>0)
+      { 
+        cout << ax << ' ' << ay << ' ' << bx << ' ' << by << endl;
+        cout << "b1 = new TLine(" << ax +offax << ',' << ay +offay << ',' << bx -offbx << ',' << by - offby<<")" << endl;
+        cout << "b2 = new TLine(" << ax -offax << ',' << ay -offay << ',' << bx +offbx << ',' << by + offby<<")" << endl;
+        cout << "b1->Draw(\"same\")" << endl;
+        cout << "b2->Draw(\"same\")" << endl;
+      }
+      rtree.query(bgi::intersects(box(point(-80,-80,-1),point(80,80,1))),std::back_inserter(lineclusters));
+      if(Verbosity()>0)  cout << "number line clus is " << lineclusters.size() << endl;
+    
+    // Check if track hits MVTX (dist to 0,0 < 2)
 
-// Build a best-fit straight line r(t) = r0 + t * vhat from the neighbor hits.
-// Use a simple PCA/power-iteration or (good enough) fit vhat as the
-// normalized difference of the farthest pair of points in neigh.
+      float dist_origin = std::abs(c)/sqrt(a*a+b*b);
+      if(_max_dist_to_origin>0)
+      {
+        if(dist_origin>_max_dist_to_origin)
+        {
+            cout << "dist continue: " << dist_origin << " > " << _max_dist_to_origin << endl;
+            continue;
+        }
+      }
 
-void HoughTrackFinder::fit_straight_line_xyz(
-  const std::vector<RtreeImpl::Leaf>& neigh,
-  const std::vector<HitXYZ>& hits,
-  double& r0x, double& r0y, double& r0z,
-  double& vx,  double& vy,  double& vz)
-{
-  // centroid
-  double sx=0, sy=0, sz=0; size_t n=neigh.size();
-  for (size_t i=0;i<n;++i){ const HitXYZ& h=hits[neigh[i].second]; sx+=h.x; sy+=h.y; sz+=h.z; 
-  std::cout<<"  neighbor "<<i<<" : "<<h.x<<" "<<h.y<<" "<<h.z<<std::endl;
-  }
-  r0x=sx/n; r0y=sy/n; r0z=sz/n;
+      for(vector<pointKey>::iterator clustertrk = lineclusters.begin();clustertrk!=lineclusters.end();++clustertrk){
+      
+      float ptx = clustertrk->first.get<0>();
+      float pty = clustertrk->first.get<1>();
+      
 
-  // crude direction: farthest-pair heuristic (robust enough for stubs)
-  size_t i0=0, i1=0; double maxd2=-1;
-  for(size_t i=0;i<n;++i){
-    const HitXYZ& a=hits[neigh[i].second];
-    for(size_t j=i+1;j<n;++j){
-      const HitXYZ& b=hits[neigh[j].second];
-      double dx=b.x-a.x, dy=b.y-a.y, dz=b.z-a.z;
-      double d2=dx*dx+dy*dy+dz*dz;
-      if(d2>maxd2){maxd2=d2;i0=i;i1=j;}
+      float res =  std::abs(a*ptx+b*pty+c)/sqrt(a*a+b*b);
+      //float res = std::abs(tsl*ptx+(-1*pty)+tint)/sqrt((tsl*tsl+1));
+      if(Verbosity()>0) cout << " x: " << ptx << " y: " << pty << " res " << res << endl;
+      if(res<4)
+      {
+	      trkclusters.push_back(*clustertrk);
+      }
     }
-  }
-  const HitXYZ& A=hits[neigh[i0].second];
-  const HitXYZ& B=hits[neigh[i1].second];
-  vx=B.x-A.x; vy=B.y-A.y; vz=B.z-A.z;
-  double norm=std::sqrt(vx*vx+vy*vy+vz*vz); if(norm<1e-12){ vx=1; vy=0; vz=0; } else { vx/=norm; vy/=norm; vz/=norm; }
+    cout << "number trk clus is " << trkclusters.size() << endl;
+    if(trkclusters.size()>=_min_nclusters)
+    {
+      cout << "setting keep true: " << trkclusters.size() << " > " << _min_nclusters << endl;
+      keep_event = true;
+    }
+
+    //Assemble tracks
+    if(_create_tracks)
+    {
+      if(trkclusters.size()>=20)
+      {
+          auto trackseed = std::make_unique<TrackSeed_v2>();
+          for(const auto& cluskeys:trkclusters)
+          {
+            //      for(vector<pointKey>::iterator cluskeys =trkclusters.begin();cluskeys!=trkclusters.end();trkclusters++){
+            
+            trackseed->insert_cluster_key(cluskeys.second);
+          }
+          //    clean_chains.push_back(trackseed);
+          // auto pseed = std::make_unique<TrackSeed_v2>(trackseed);
+          m_seedContainer->insert(trackseed.get()); 
+          cout << "number trk keys is " << trackseed->size_cluster_keys() << endl;
+          numberofseeds++;
+      }
+    }
+}
   
+  cout << "number of seeds is " << numberofseeds << endl;
+  if(_write_ntp)
+  {
+    _ntp_max->Fill(_nevent,intmin,intmax,slmin,slmax);
+  }
+  if(!keep_event)
+  {
+    cout << " ABORT !keep " << endl;
+    return Fun4AllReturnCodes::ABORTEVENT;
+  }
+  return Fun4AllReturnCodes::EVENT_OK;
 }
 
-bool HoughTrackFinder::to_straight_perigee(
-  const std::vector<RtreeImpl::Leaf>& neigh,
-  const std::vector<HitXYZ>& hits,
-  float& d0, float& z0, float& phi0, float& theta, float& qOverP)
+
+int HoughTrackFinder::Setup(PHCompositeNode* topNode)
 {
-  double r0x, r0y, r0z, vx, vy, vz;
-  std::cout<<"HoughTrackFinder::to_straight_perigee "<<neigh.size()<<" points"<<std::endl;
-  fit_straight_line_xyz(neigh, hits, r0x, r0y, r0z, vx, vy, vz);
-std::cout<<"  straight line: r0 = ("<<r0x<<", "<<r0y<<", "<<r0z<<") v = ("<<vx<<", "<<vy<<", "<<vz<<")"<<std::endl;
-  // direction → angles
-  phi0  = (float)std::atan2(vy, vx);
-  double vT2 = vx*vx + vy*vy;
-
-  // closest approach to z-axis
-  double tstar = 0.0;
-  if (vT2 > 1e-12) tstar = -(r0x*vx + r0y*vy)/vT2;
-  double xP = r0x + tstar*vx;
-  double yP = r0y + tstar*vy;
-  double zP = r0z + tstar*vz;
-
-  // perigee params
-  d0   = (float)(-xP*std::sin(phi0) + yP*std::cos(phi0));
-  z0   = (float)zP;
-  double vz_clamped = std::max(-1.0, std::min(1.0, vz));
-  theta = (float)std::acos(vz_clamped);   // polar angle to z-axis
-  qOverP = 0.0f;                          // straight line ⇒ zero curvature
-std::cout<<"  perigee params: d = "<<d0<<" z0 = "<<z0<<" phi0 = "<<phi0<<" theta = "<<theta<<std::endl;
-  return std::isfinite(d0) && std::isfinite(z0) && std::isfinite(phi0)
-      && std::isfinite(theta);
+  cout << "Called Setup" << endl;
+  cout << "topNode:" << topNode << endl;
+  // PHTrackSeeding::Setup(topNode);
+  //  int ret = GetNodes(topNode);
+  //return ret;
+  GetNodes(topNode);
+  return Fun4AllReturnCodes::EVENT_OK;
 }
 
-//============================================================
-// 3D Helix fit (perigee parameters) with parameter constraints
-//============================================================
-bool HoughTrackFinder::helix_fit_3D(
-  const std::vector<RtreeImpl::Leaf>& neigh,
-  const std::vector<HitXYZ>& hits,
-  float& d0, float& z0, float& phi0, float& theta, float& qOverP)
+int HoughTrackFinder::End(PHCompositeNode* topNode)
 {
-  std::cout<<"!!!!!!!!HoughTrackFinder::helix_fit_3D "<<neigh.size()<<" points"<<std::endl;
-  const size_t n = neigh.size();
-  if (n < 4) return false;
-
-  // ------------------------------
-  // Constants and constraints
-  // ------------------------------
-  const double kBField_T = 1.4;           // Tesla
-  //const double kMinRadius_cm = 0.5;       // min valid circle radius
-  const double kMaxRadius_cm = 140.0;     // max valid radius (~5 m)
-  const double kMaxD0_cm = 5.0;          // max transverse impact
-  const double kMaxZ0_cm = 20.0;         // max z at perigee
-  const double kMinTheta_rad = 0;      // 
-  const double kMaxTheta_rad = 10;      // just below π
-
-  // ------------------------------
-  // 1. Extract hit coordinates
-  // ------------------------------
-  std::vector<float> x(n), y(n), z(n);
-  for (size_t i = 0; i < n; ++i)
-  {
-    const HitXYZ& h = hits[neigh[i].second];
-    x[i] = h.x;
-    y[i] = h.y;
-    z[i] = h.z;
-    std::cout<<"Hit "<<i<<" : x = "<<x[i]<<"   y = "<<y[i]<<"   z = "<<z[i]<<std::endl;
+  if(topNode==nullptr){
+    std::cout << PHWHERE << "No topNode, bailing."
+	      << std::endl;
+    return Fun4AllReturnCodes::ABORTEVENT;
   }
-
-  // ------------------------------
-  // 2. Circle fit (Kåsa method)
-  // ------------------------------
-  double sum_x = 0, sum_y = 0, sum_x2 = 0, sum_y2 = 0;
-  double sum_xy = 0, sum_x3 = 0, sum_y3 = 0, sum_x1y2 = 0, sum_x2y1 = 0;
-  for (size_t i = 0; i < n; ++i)
-  {
-    const double xi = x[i];
-    const double yi = y[i];
-    const double xi2 = xi*xi;
-    const double yi2 = yi*yi;
-
-    sum_x += xi;
-    sum_y += yi;
-    sum_x2 += xi2;
-    sum_y2 += yi2;
-    sum_xy += xi*yi;
-    sum_x3 += xi2*xi;
-    sum_y3 += yi2*yi;
-    sum_x1y2 += xi*yi2;
-    sum_x2y1 += xi2*yi;
+    
+  if(_write_ntp){
+    _tfile->cd();
+    _ntp_cos->Write();
+    _ntp_stub->Write();
+    _ntp_max->Write();
+    _tfile->Close();
+    cout << "Called End " << endl;
   }
-
-  const double C = n*sum_x2 - sum_x*sum_x;
-  const double D = n*sum_xy - sum_x*sum_y;
-  const double E = n*sum_y2 - sum_y*sum_y;
-  const double G = 0.5*(n*(sum_x3 + sum_x1y2) - (sum_x2 + sum_y2)*sum_x);
-  const double H = 0.5*(n*(sum_y3 + sum_x2y1) - (sum_x2 + sum_y2)*sum_y);
-  const double denom = (C*E - D*D);
-  if (fabs(denom) < 1e-12) return false;
-
-  const double xc = (G*E - D*H)/denom;
-  const double yc = (C*H - D*G)/denom;
-  const double R = std::sqrt((sum_x2 + sum_y2 - 2*xc*sum_x - 2*yc*sum_y)/n + xc*xc + yc*yc);
-std::cout<<"Fitted circle:   xc = "<<xc<<"   yc = "<<yc<<"   R = "<<R<<std::endl;
-if (!std::isfinite(R) || R > kMaxRadius_cm) {
-  return to_straight_perigee(neigh, hits, d0, z0, phi0, theta, qOverP);
+  return Fun4AllReturnCodes::EVENT_OK;
 }
-  // ------------------------------
-  // 3. Compute phi0 and d0
-  // ------------------------------
-  const double rc = std::sqrt(xc*xc + yc*yc);
-  phi0 = std::atan2(yc, xc) + M_PI/2.0;
-  d0 = rc - R;
-  if (fabs(d0) > kMaxD0_cm) return false;
-
-  // ------------------------------
-  // 4. Charge sign by rotation sense
-  // ------------------------------
-  double cross = 0;
-  for (size_t i = 1; i < n; ++i)
-    cross += (x[i-1]*y[i] - y[i-1]*x[i]);
-  const int qsign = (cross > 0 ? +1 : -1);
-
-  // ------------------------------
-  // 5. Compute arc lengths s_i along helix
-  // ------------------------------
-  std::vector<double> s(n, 0.0);
-  for (size_t i = 1; i < n; ++i)
-  {
-    double phi_prev = std::atan2(y[i-1]-yc, x[i-1]-xc);
-    double phi_curr = std::atan2(y[i]-yc, x[i]-xc);
-    double dphi = phi_curr - phi_prev;
-    while (dphi > M_PI)  dphi -= 2*M_PI;
-    while (dphi < -M_PI) dphi += 2*M_PI;
-    s[i] = s[i-1] + qsign * R * dphi;
-  }
-
-  // ------------------------------
-  // 6. Linear fit z(s)
-  // ------------------------------
-  double sum_s = 0, sum_s2 = 0, sum_z = 0, sum_sz = 0;
-  for (size_t i = 0; i < n; ++i)
-  {
-    sum_s  += s[i];
-    sum_s2 += s[i]*s[i];
-    sum_z  += z[i];
-    sum_sz += s[i]*z[i];
-  }
-  const double denom2 = (n*sum_s2 - sum_s*sum_s);
-  if (fabs(denom2) < 1e-12) return false;
-
-  const double slope = (n*sum_sz - sum_s*sum_z)/denom2; // tan(lambda)
-  z0 = (sum_z - slope*sum_s)/n;
-  if (fabs(z0) > kMaxZ0_cm) return false;
-
-  const double tan_lambda = slope;
-  theta = std::atan(1.0 / tan_lambda);
-  if (theta < kMinTheta_rad || theta > kMaxTheta_rad || !std::isfinite(theta)) return false;
-
-  // ------------------------------
-  // 7. Compute q/p with cm→m conversion
-  // ------------------------------
-  const double R_m = R * 0.01; // cm → m
-  const double pt = 0.3 * kBField_T * R_m;
-  qOverP = (qsign * 1.0) / std::sqrt(pt*pt + (pt*tan_lambda)*(pt*tan_lambda));
-
-  // ------------------------------
-  // 8. Validity check
-  // ------------------------------
-  if (!std::isfinite(qOverP) || fabs(qOverP) > 10.0) return false;
-
-  return true;
-}
-
-
 
