@@ -101,6 +101,81 @@ using myrtree = bgi::rtree<pointKey, bgi::quadratic<16>>;
 
 using namespace std;
 
+namespace
+{
+  inline float dcaBinWidth(float dca)
+  {
+    const float fine_edge    = 3.0f;
+    const float fine_width   = 0.5f;
+
+    const float mid_edge     = 10.0f;
+    const float mid_width    = 2.0f;
+
+    const float coarse_width = 20.0f;
+
+    const float ad = std::fabs(dca);
+    if (ad < fine_edge)          return fine_width;
+    else if (ad < mid_edge)      return mid_width;
+    else                         return coarse_width;
+  }
+
+  // NEW: clip [low,high] to the region that |dca| belongs to
+  inline void dcaSearchRange(float dca,
+                             float width,
+                             float dcamin_global,
+                             float dcamax_global,
+                             float& low,
+                             float& high)
+  {
+    const float e1 = 3.0f;   // boundary 1
+    const float e2 = 10.0f;  // boundary 2
+    const float ad = std::fabs(dca);
+
+    low  = dca - width;
+    high = dca + width;
+
+    // Clip to overall global min/max first (safety)
+    low  = std::max(low,  dcamin_global);
+    high = std::min(high, dcamax_global);
+
+    if (ad < e1)
+    {
+      // region [-e1, +e1]
+      low  = std::max(low,  -e1);
+      high = std::min(high, +e1);
+    }
+    else if (ad < e2)
+    {
+      // region (e1,e2] or [-e2,-e1)
+      if (dca > 0)
+      {
+        low  = std::max(low,  +e1);
+        high = std::min(high, +e2);
+      }
+      else
+      {
+        low  = std::max(low,  -e2);
+        high = std::min(high, -e1);
+      }
+    }
+    else
+    {
+      // outer region |dca| > e2
+      if (dca > 0)
+      {
+        low  = std::max(low, +e2);
+        // high already clipped to dcamax_global
+      }
+      else
+      {
+        high = std::min(high, -e2);
+        // low already clipped to dcamin_global
+      }
+    }
+  }
+}
+
+
 vector<TrkrCluster*> clusterpoints;
 
 HoughTrackFinder::HoughTrackFinder(const std::string& name)
@@ -146,6 +221,18 @@ int HoughTrackFinder::Init(PHCompositeNode* topNode)
     // full track params: use dca, phi, alpha=phi
     _ntp_trk = new TNtuple("ntp_trk", "full track params",
                            "ev:dca:phi:alpha:dist0:nclus");
+
+    const int   nDcaBins  = 240;
+    const float dcaMin    = -61;
+    const float dcaMax    =  61;
+
+    const int   nPhiBins  = 180;
+    const float phiMin    = -TMath::Pi();
+    const float phiMax    =  TMath::Pi();
+
+    _hHough = new TH2F("hHough", "Hough space;DCA (cm);#phi (rad)",
+                       nDcaBins, dcaMin, dcaMax,
+                       nPhiBins, phiMin, phiMax);
   }
   return Fun4AllReturnCodes::EVENT_OK;
 }
@@ -412,12 +499,14 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
 
     if (fcount <= 0) continue;
     if (std::isnan(fslope) || !std::isfinite(fslope)) continue;
+    if (fslope ==0 && fintercept ==0) continue;
 
     if (std::isfinite(fslope))
     {
       // convert (slope, intercept) -> (phi, dca)
       const double phi = std::atan(fslope);
       const double dca = fintercept / std::sqrt(fslope*fslope + 1.0);
+      if (dca ==0 && phi ==0) continue;
 
       // insert stub in Hough space (dca, phi)
       rtree_stub.insert(std::make_pair(point(dca, phi, 0.0), 0));
@@ -430,6 +519,8 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
                         static_cast<float>(phi),
                         static_cast<float>(phi),
                         static_cast<float>(dca));
+
+          _hHough->Fill(dca, phi);
       }
 
       // update Hough space ranges
@@ -460,8 +551,8 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
 
     map <int,pair<float,float>> trkmap;
 
-    float dca_width = (dcamax - dcamin)/40;
-    float phi_width = (phimax - phimin)/40;
+   // float dca_width = (dcamax - dcamin)/40;
+    float phi_width = (phimax - phimin)/30;
 
     for(vector<pointKey>::iterator stub = allstubs.begin();
         stub!=allstubs.end();++stub)
@@ -469,17 +560,29 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
       float p_dca = stub->first.get<0>();
       float p_phi = stub->first.get<1>();
 
-      vector<pointKey> trkcand;
+      float dca_width = dcaBinWidth(p_dca);
+
+        // compute non-overlapping DCA interval for this region
+        float dlow = 0.f;
+        float dhigh = 0.f;
+        dcaSearchRange(p_dca, dca_width, dcamin, dcamax, dlow, dhigh);
+
+             
       std::cout << " Searching box around stub dca: " << p_dca
                 << " phi: " << p_phi
                 << " dca_w: " << dca_width
                 << " phi_w: " << phi_width << std::endl;
 
-      rtree_stub.query(
-        bgi::intersects(
-          box(point(p_dca-dca_width, p_phi-phi_width, -1),
-              point(p_dca+dca_width, p_phi+phi_width,  1))),
-        std::back_inserter(trkcand));
+        vector<pointKey> trkcand;
+        rtree_stub.query(
+          bgi::intersects(
+            box(point(dlow,      p_phi - phi_width, -1),
+                point(dhigh,     p_phi + phi_width,  1))),
+          std::back_inserter(trkcand));
+
+
+
+   \
       
       int   ntrk   = trkcand.size();
       int   count  = 0;
@@ -521,20 +624,33 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
     if( trkmap.size()>0)
     {
       int size_before = rtree_stub.size();
-      if(Verbosity()>0)
+     
         cout << "mapend: " << trkmap.rbegin()->first
-             << " | " << (trkmap.rbegin()->second).first
-             << " | " << trkmap.rbegin()->second.second << endl;
+             << " votes | " << (trkmap.rbegin()->second).first
+             << " dca | " << trkmap.rbegin()->second.second  << " phi | "<< endl;
 
       // remove stubs in the most populated Hough cell
       float best_dca = trkmap.rbegin()->second.first;
       float best_phi = trkmap.rbegin()->second.second;
 
+      float dca_width = dcaBinWidth(best_dca);
+
+      float dlow = 0.f;
+      float dhigh = 0.f;
+      dcaSearchRange(best_dca, dca_width, dcamin, dcamax, dlow, dhigh);
+
+
+      std::cout<< " best dca: " << best_dca
+               << " best phi: " << best_phi
+               << " dca_w: " << dca_width
+               << " phi_w: " << phi_width << std::endl;
+
+
       vector<pointKey> rmcand;
       rtree_stub.query(
         bgi::intersects(
-          box(point(best_dca-dca_width, best_phi-phi_width, -1),
-              point(best_dca+dca_width, best_phi+phi_width,  1))),
+          box(point(dlow,      best_phi - phi_width, -1),
+              point(dhigh,     best_phi + phi_width,  1))),
         std::back_inserter(rmcand));
 
       for(vector<pointKey>::iterator rmstub = rmcand.begin();
@@ -542,7 +658,10 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
       {
         float rmp_dca = rmstub->first.get<0>();
         float rmp_phi = rmstub->first.get<1>();
-        if(Verbosity()>0)
+
+
+
+      
           cout<< "    rm " <<  " dca: " << rmp_dca
               << " phi: " << rmp_phi 
               << endl;
@@ -569,7 +688,7 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
 
   for (const auto& [key, value] : outtrkmap)
   {
-    if(Verbosity()>0)
+  
       std::cout <<" out ev: " << _nevent << '[' << key << "] = "
                 << value.first << " | " << value.second << std::endl;
 
@@ -615,18 +734,15 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
       }
     }
 
-    float dist = 4;
+   // float dist = 0.2;
     float alpha = phi;  // direction angle of the track in XY
+    /*
     float offax = -1*dist*std::sin(alpha);
     float offay = -1*dist*std::cos(alpha);
     float offbx =  1*dist*std::sin(alpha);
     float offby =  1*dist*std::cos(alpha);
 
-    vector<pointKey> trkclusters;
-    vector<pointKey> lineclusters;
 
-    if(Verbosity()>0)
-    { 
       cout << ax << ' ' << ay << ' ' << bx << ' ' << by << endl;
       cout << "b1 = new TLine(" << ax +offax << ',' << ay +offay
            << ',' << bx -offbx << ',' << by - offby<<")" << endl;
@@ -634,14 +750,17 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
            << ',' << bx +offbx << ',' << by + offby<<")" << endl;
       cout << "b1->Draw(\"same\")" << endl;
       cout << "b2->Draw(\"same\")" << endl;
-    }
+    */
+
+    vector<pointKey> trkclusters;
+    vector<pointKey> lineclusters;
 
     rtree.query(
       bgi::intersects(
         box(point(-80,-80,-120),
             point( 80, 80, 120))),
       std::back_inserter(lineclusters));
-    if(Verbosity()>0)
+
       cout << "number line clus is " << lineclusters.size() << endl;
     
     // Check if track hits MVTX (dist to 0,0 < 2)
@@ -664,10 +783,10 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
       float pty = clustertrk->first.get<1>();
 
       float res = std::abs(a*ptx + b*pty + c)/std::sqrt(a*a + b*b);
-      if(Verbosity()>0)
+      
         cout << " x: " << ptx << " y: " << pty << " res " << res << endl;
 
-      if(res<4)
+      if(res<0.5)
       {
         trkclusters.push_back(*clustertrk);
       }
@@ -742,6 +861,7 @@ int HoughTrackFinder::End(PHCompositeNode* topNode)
     _ntp_stub->Write();
     _ntp_max->Write();
     _ntp_trk->Write();
+    _hHough->Write();
     _tfile->Close();
     cout << "Called End " << endl;
   }

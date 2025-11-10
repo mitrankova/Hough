@@ -1,11 +1,8 @@
 #ifndef HoughTrackFinder_H
 #define HoughTrackFinder_H
+#include <TH2F.h>
 
-/*!
- *  \file HoughTrackFinder.h
- *  \RTree based Hough tracking for cosmics (TPC)
- *  \author Christof Roland
- */
+
 
 //begin
 
@@ -166,6 +163,7 @@ class HoughTrackFinder : public SubsysReco
   TNtuple *_ntp_stub = nullptr;  // stub Hough params (now dca, phi)
   TNtuple *_ntp_max  = nullptr;  // Hough ranges
   TNtuple *_ntp_trk  = nullptr;  // track params
+   TH2F    *_hHough   = nullptr;
 
   TFile   *_tfile    = nullptr;
 
