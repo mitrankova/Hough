@@ -2,48 +2,44 @@
 #define HoughTrackFinder_H
 
 /*!
- *  \file RHoughTrackFinder.h
- *  \RTree based hough tracking for cosmics
+ *  \file HoughTrackFinder.h
+ *  \RTree based Hough tracking for cosmics (TPC)
  *  \author Christof Roland
  */
-
 
 //begin
 
 #include "trackreco/PHTrackSeeding.h"
 
 #include <fun4all/SubsysReco.h>
-#include <trackbase/TrkrDefs.h>  // for cluskey
+#include <trackbase/TrkrDefs.h>       // for cluskey
 #include <trackbase/ActsGeometry.h>
 
-
-//TrkrCluster includes
-#include <trackbase/TrkrCluster.h>                      // for TrkrCluster
-#include <trackbase/TrkrDefs.h>                         // for getLayer, clu...
+// TrkrCluster includes
+#include <trackbase/TrkrCluster.h>    // for TrkrCluster
 #include <trackbase/TrkrClusterContainer.h>
 
 #include <fun4all/Fun4AllReturnCodes.h>
-#include <fun4all/SubsysReco.h>                          // for SubsysReco
 
 #include <phool/PHCompositeNode.h>
 #include <phool/PHIODataNode.h>
-#include <phool/PHNode.h>                                // for PHNode
+#include <phool/PHNode.h>
 #include <phool/PHNodeIterator.h>
-#include <phool/PHObject.h>                              // for PHObject
+#include <phool/PHObject.h>
 #include <phool/PHRandomSeed.h>
-#include <phool/PHTimer.h>                               // for PHTimer
+#include <phool/PHTimer.h>
 #include <phool/getClass.h>
-#include <phool/phool.h>                                 // for PHWHERE
+#include <phool/phool.h>              // for PHWHERE
 
-//ROOT includes for debugging
+// ROOT includes for debugging
 #include <TFile.h>
-#include <TMatrixDSymfwd.h>                              // for TMatrixDSym
-#include <TMatrixTSym.h>                                 // for TMatrixTSym
-#include <TMatrixTUtils.h>                               // for TMatrixTRow
+#include <TMatrixDSymfwd.h>           // for TMatrixDSym
+#include <TMatrixTSym.h>              // for TMatrixTSym
+#include <TMatrixTUtils.h>
 #include <TNtuple.h>
-#include <TVector3.h>                                    // for TVector3
-#include <TVectorDfwd.h>                                 // for TVectorD
-#include <TVectorT.h>                                    // for TVectorT
+#include <TVector3.h>
+#include <TVectorDfwd.h>
+#include <TVectorT.h>
 
 // gsl
 #include <gsl/gsl_rng.h>
@@ -52,42 +48,39 @@
 #include <Eigen/Dense>
 #include <Eigen/LU>
 
-//BOOST for combi seeding
+// BOOST for combi seeding
 #include <boost/geometry.hpp>
 #include <boost/geometry/geometries/box.hpp>
 #include <boost/geometry/geometries/point.hpp>
 #include <boost/geometry/index/rtree.hpp>
 
-
 // standard includes
 #include <algorithm>
-#include <cassert>                                      // for assert
+#include <cassert>
 #include <cfloat>
-#include <climits>                                      // for UINT_MAX
+#include <climits>
 #include <cmath>
-#include <cstdlib>                                      // for NULL, exit
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
-#include <iterator>                                      // for back_insert_...
+#include <iterator>
 #include <map>
 #include <memory>
-#include <string>                      // for string
+#include <string>
 #include <tuple>
 #include <vector>
 
 class TGeoManager;
 
-
-#define LogDebug(exp) std::cout << "DEBUG: " << __FILE__ << ": " << __LINE__ << ": " << exp
-#define LogError(exp) std::cout << "ERROR: " << __FILE__ << ": " << __LINE__ << ": " << exp
+#define LogDebug(exp)   std::cout << "DEBUG: "   << __FILE__ << ": " << __LINE__ << ": " << exp
+#define LogError(exp)   std::cout << "ERROR: "   << __FILE__ << ": " << __LINE__ << ": " << exp
 #define LogWarning(exp) std::cout << "WARNING: " << __FILE__ << ": " << __LINE__ << ": " << exp
-
 
 using namespace Eigen;
 using namespace std;
-namespace bg = boost::geometry;
+
+namespace bg  = boost::geometry;
 namespace bgi = boost::geometry::index;
-//end
 
 // forward declarations
 class PHCompositeNode;
@@ -108,17 +101,13 @@ class TRKR_CLUSTER;
 class SvtxHitMap;
 class TrackSeedContainer;
 
+// geometry / rtree typedefs (matching the .cc file)
+using point    = bg::model::point<float, 3, bg::cs::cartesian>;
+using box      = bg::model::box<point>;
+using pointKey = std::pair<point, TrkrDefs::cluskey>;
+using myrtree  = bgi::rtree<pointKey, bgi::quadratic<16>>;
 
-namespace bg = boost::geometry;
-namespace bgi = boost::geometry::index;
-typedef bg::model::point<float, 3, bg::cs::cartesian> point;
-typedef bg::model::box<point> box;
-typedef std::pair<point, TrkrDefs::cluskey> pointKey;
-
-typedef uint64_t cluskey;
-
-
-
+using cluskey_t = uint64_t;
 
 class HoughTrackFinder : public SubsysReco
 {
@@ -126,14 +115,13 @@ class HoughTrackFinder : public SubsysReco
   HoughTrackFinder(const std::string &name = "PHRTreeSeeding");
 
   double chisq(const double *xx);
-  //vector<TrkrCluster*> clusterpoints;
-  virtual ~HoughTrackFinder()
-  {
-  }
-  void set_write_debug_ntuple(bool b){_write_ntp = b;}
-  void set_create_tracks(bool b){_create_tracks = b;}
-  void set_max_distance_to_origin(float val){ _max_dist_to_origin = val;}
-  void set_min_nclusters(int n){ _min_nclusters = n;}
+
+  virtual ~HoughTrackFinder() {}
+
+  void set_write_debug_ntuple(bool b)   { _write_ntp         = b; }
+  void set_create_tracks(bool b)        { _create_tracks     = b; }
+  void set_max_distance_to_origin(float val) { _max_dist_to_origin = val; }
+  void set_min_nclusters(int n)         { _min_nclusters     = n; }
 
  protected:
   int Setup(PHCompositeNode *topNode);
@@ -143,48 +131,43 @@ class HoughTrackFinder : public SubsysReco
   int process_event(PHCompositeNode *topNode) override;
   int End(PHCompositeNode *topNode) override;
 
-
  private:
-  /// fetch node pointers
-  // int GetNodes(PHCompositeNode *topNode);
-
-   //static vector<tuple<double, double, double>> clusterpoints;
-   /*static*/ //vector<TrkrCluster*> clusterpoints;
-
-  // node pointers
+  // cluster container
   TrkrClusterContainer *_cluster_map = nullptr;
-  //nodes to get norm vector
 
+  // geometry
+  ActsGeometry *tGeometry {nullptr};
+
+  // helpers
   double phiadd(double phi1, double phi2);
   double phidiff(double phi1, double phi2);
   double pointKeyToTuple(pointKey *pK);
   double costfunction(const double *xx);
-  //double chisq(const double *xx);
-  void get_stub(const bgi::rtree<pointKey, bgi::quadratic<16>> &rtree, float pointx, float pointy, float pointz, int &count, double &slope, double &intercept);
-  ActsGeometry *tGeometry{nullptr};
+
+  // stub finder: still fits y = m x + b in XY and returns slope/intercept
+  void get_stub(const myrtree &rtree,
+                float pointx, float pointy, float pointz,
+                int &count, double &slope, double &intercept);
+
 #ifndef __CINT__
  private:
   int createNodes(PHCompositeNode *topNode);
-  std::string m_trackMapName = "TpcTrackSeedContainer";
+
+  std::string        m_trackMapName   = "TpcTrackSeedContainer";
   TrackSeedContainer *m_seedContainer = nullptr;
 
-  //int _nlayers_all;
-  //unsigned int _nlayers_seeding;
-  //std::vector<int> _seeding_layer;
+  unsigned int _nevent            = 0;
+  bool         _write_ntp         = true;
+  bool         _create_tracks     = true;
+  float        _max_dist_to_origin = 0;
+  unsigned int _min_nclusters     = 20;
 
-  unsigned int _nevent = 0;
-  bool _write_ntp = true;
-  bool _create_tracks = true;
-  float _max_dist_to_origin = 0;
-  unsigned int _min_nclusters = 20;
-  TNtuple *_ntp_cos = nullptr;
-  TNtuple *_ntp_stub = nullptr;
-  TNtuple *_ntp_max = nullptr;
-    TNtuple* _ntp_trk;
+  TNtuple *_ntp_cos  = nullptr;  // cluster positions
+  TNtuple *_ntp_stub = nullptr;  // stub Hough params (now dca, phi)
+  TNtuple *_ntp_max  = nullptr;  // Hough ranges
+  TNtuple *_ntp_trk  = nullptr;  // track params
 
-  TFile *_tfile = nullptr;
-  //std::vector<float> _radii_all;
-
+  TFile   *_tfile    = nullptr;
 
 #endif  // __CINT__
 };
