@@ -160,7 +160,7 @@ class HoughTrackFinder : public SubsysReco
   double pointKeyToTuple(pointKey *pK);
   double costfunction(const double *xx);
   //double chisq(const double *xx);
-  void get_stub(const bgi::rtree<pointKey, bgi::quadratic<16>> &rtree, float pointx, float pointy, int &count, double &slope, double &intercept);
+  void get_stub(const bgi::rtree<pointKey, bgi::quadratic<16>> &rtree, float pointx, float pointy, float pointz, int &count, double &slope, double &intercept);
   ActsGeometry *tGeometry{nullptr};
 #ifndef __CINT__
  private:
@@ -180,6 +180,8 @@ class HoughTrackFinder : public SubsysReco
   TNtuple *_ntp_cos = nullptr;
   TNtuple *_ntp_stub = nullptr;
   TNtuple *_ntp_max = nullptr;
+    TNtuple* _ntp_trk;
+
   TFile *_tfile = nullptr;
   //std::vector<float> _radii_all;
 
