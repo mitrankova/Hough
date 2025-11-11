@@ -1,7 +1,7 @@
 #ifndef HoughTrackFinder_H
 #define HoughTrackFinder_H
 #include <TH2F.h>
-
+#include <TTree.h>
 
 
 //begin
@@ -164,6 +164,20 @@ class HoughTrackFinder : public SubsysReco
   TNtuple *_ntp_max  = nullptr;  // Hough ranges
   TNtuple *_ntp_trk  = nullptr;  // track params
    TH2F    *_hHough   = nullptr;
+
+     TTree* _track_tree;
+
+  int   _trk_ev;
+  float _trk_dca;
+  float _trk_phi;
+  float _trk_alpha;
+  float _trk_dist0;
+  int   _trk_nclus;
+
+  std::vector<float>    _trk_r;       
+  std::vector<float>    _trk_phi_clu; 
+  std::vector<float>    _trk_z;      
+  std::vector<ULong64_t> _trk_cluskey;
 
   TFile   *_tfile    = nullptr;
 
