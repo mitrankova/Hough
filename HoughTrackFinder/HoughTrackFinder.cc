@@ -221,12 +221,11 @@ int HoughTrackFinder::Init(PHCompositeNode* topNode)
     _tfile = new TFile("./costuple.root", "RECREATE");
     _ntp_cos = new TNtuple("ntp_cos", "cos event info","ev:x:y:z");
     // store (dca, phi, tan(phi), x0)
-    _ntp_stub = new TNtuple("ntp_stub", "cos stub info","ev:dca:phi:tanphi:x0");
+    _ntp_stub = new TNtuple("ntp_stub", "cos stub info","ev:dca:phi:theta:z0");
     // store (dca min/max, phi min/max)
     _ntp_max = new TNtuple("ntp_max", "cos stub info","ev:dcamin:dcamax:phimin:phimax");
     // full track params: use dca, phi, alpha=phi
-    _ntp_trk = new TNtuple("ntp_trk", "full track params",
-                           "ev:dca:phi:alpha:dist0:nclus");
+    _ntp_trk = new TNtuple("ntp_trk", "full track params", "ev:dca:phi:alpha:dist0:nclus");
 
     const int   nDcaBins  = 240;
     const float dcaMin    = -61;
@@ -321,30 +320,32 @@ double HoughTrackFinder::phidiff(double phi1, double phi2){
 // NOTE: search_rtree stores (r, phi, z); we still fit a line in XY
 void HoughTrackFinder::get_stub(const myrtree &search_rtree,
                                 float pointr, float pointphi, float pointz,
-                                int &count, double &slope, double &intercept)
+                                int &count,
+                                double &dca,
+                                double &phi,
+                                double &z0,
+                                double &theta)
 {
   // search window in (r, phi, z)
-  const float m1_dr   = 1.5;    // cm in radius
-  const float m1_dphi = 0.05;   // rad
-  const float m1_dz   = 2.0;    // cm
+  const float m1_dr   = 1.5f;   // cm in radius
+  const float m1_dphi = 0.05f;  // rad
+  const float m1_dz   = 2.0f;   // cm
 
   std::vector<pointKey> boxclusters;
 
-  // 3D box: (r±dr, phi±dphi, z±dz)
+  // 3D search box in cylindrical coordinates
   search_rtree.query(
       bgi::intersects(
-        box(
-          point(pointr   - m1_dr,
-                pointphi - m1_dphi,
-                pointz   - m1_dz),
-          point(pointr   + m1_dr,
-                pointphi + m1_dphi,
-                pointz   + m1_dz)
-        )
-      ),
+          box(
+              point(pointr   - m1_dr,
+                    pointphi - m1_dphi,
+                    pointz   - m1_dz),
+              point(pointr   + m1_dr,
+                    pointphi + m1_dphi,
+                    pointz   + m1_dz))),
       std::back_inserter(boxclusters));
 
-  // convert center back to (x,y) for debug
+  // Debug: center in xy for sanity
   float cx = pointr * std::cos(pointphi);
   float cy = pointr * std::sin(pointphi);
 
@@ -357,82 +358,138 @@ void HoughTrackFinder::get_stub(const myrtree &search_rtree,
             << " z:[" << pointz-m1_dz  << "," << pointz+m1_dz   << "]"
             << " nboxclus " << boxclusters.size() << std::endl;
 
-  // still fit a line in XY
-  std::vector<std::pair<double,double>> pts;
+  // collect 3D points in Cartesian (x,y,z)
+  std::vector<Eigen::Vector3d> pts3;
+  pts3.reserve(boxclusters.size());
 
-  int    nhit  = 0;
-  double xsum  = 0;
-  double x2sum = 0;
-  double ysum  = 0;
-  double xysum = 0;
-
-  for (auto pbox = boxclusters.begin(); pbox!=boxclusters.end(); ++pbox)
+  for (auto pbox = boxclusters.begin(); pbox != boxclusters.end(); ++pbox)
   {
-    // R-tree stores (r, phi, z)
-    float r   = pbox->first.get<0>();
-    float phi = pbox->first.get<1>();
-    // float z = pbox->first.get<2>(); // not used for XY fit
+    float r_hit   = pbox->first.get<0>();
+    float phi_hit = pbox->first.get<1>();
+    float z_hit   = pbox->first.get<2>();
 
-    float boxx = r * std::cos(phi);
-    float boxy = r * std::sin(phi);
+    float x = r_hit * std::cos(phi_hit);
+    float y = r_hit * std::sin(phi_hit);
 
-    nhit++;
-    pts.emplace_back(boxx, boxy);
-
-    xsum  += boxx;
-    ysum  += boxy;
-    x2sum += boxx*boxx;
-    xysum += boxx*boxy;
+    pts3.emplace_back(x, y, z_hit);
   }
 
-  count = nhit;
+  count = static_cast<int>(pts3.size());
 
   const int MIN_STUB_HITS = 2;
-  if (nhit < MIN_STUB_HITS)
+  if (count < MIN_STUB_HITS)
   {
-    slope = 0;
-    intercept = 0;
+    dca   = 0.;
+    phi   = 0.;
+    z0    = 0.;
+    theta = 0.;
     return;
   }
 
-  const double denominator = (x2sum * nhit) - (xsum*xsum);
-  if (denominator == 0)
+  // 1) centroid
+  Eigen::Vector3d mean = Eigen::Vector3d::Zero();
+  for (const auto &p : pts3) mean += p;
+  mean /= static_cast<double>(count);
+
+  // 2) covariance matrix
+  Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+  for (const auto &p : pts3)
   {
-    slope = 0;
-    intercept = 0;
+    Eigen::Vector3d q = p - mean;
+    cov += q * q.transpose();
+  }
+
+  Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> es(cov);
+  if (es.info() != Eigen::Success)
+  {
+    std::cout << " get_stub: Eigen decomposition failed" << std::endl;
+    dca   = 0.;
+    phi   = 0.;
+    z0    = 0.;
+    theta = 0.;
     count = 0;
     return;
   }
 
-  slope     = (xysum * nhit - xsum * ysum) / denominator;
-  intercept = (x2sum * ysum - xsum * xysum) / denominator;
+  // eigenvalues are sorted ascending; largest is index 2
+  Eigen::Vector3d dir = es.eigenvectors().col(2);
+  dir.normalize();
 
-  double chi2 = 0.;
-  for (const auto &p : pts)
+  // enforce a consistent sign convention (e.g. uz > 0)
+  if (dir.z() < 0) dir = -dir;
+
+  double ux = dir.x();
+  double uy = dir.y();
+  double uz = dir.z();
+
+  double norm_xy = std::sqrt(ux*ux + uy*uy);
+  if (norm_xy < 1e-6)
   {
-    const double xx = p.first;
-    const double yy = p.second;
-    const double yfit = slope*xx + intercept;
-    const double dy   = yy - yfit;
-    chi2 += dy*dy;
-    std::cout << " stub pt x: " << xx
-              << " y: " << yy
-              << " slope: " << slope
-              << " intercept: " << intercept
-              << " chi2: " << chi2 << std::endl;
+    std::cout << " get_stub: degenerate direction in XY" << std::endl;
+    dca   = 0.;
+    phi   = 0.;
+    z0    = 0.;
+    theta = 0.;
+    count = 0;
+    return;
   }
 
-  const double ndof = nhit - 2;
-  const double chi2ndf = (ndof > 0) ? chi2/ndof : 1e9;
-  std::cout << " chi2ndf: " << chi2ndf << " nhit " << nhit << std::endl;
+  // 3) track direction parameters in XY and w.r.t. beam axis
+  phi   = std::atan2(uy, ux);                 // azimuth
+  theta = std::atan2(norm_xy, uz);            // polar angle to beam (z)
 
-  // still very tight – tune as needed
-  const double MAX_STUB_CHI2NDF = 0.02;
+  // 4) DCA and z0 from closest approach in XY
+  //    line: r(t) = mean + t * dir
+  double x0 = mean.x();
+  double y0 = mean.y();
+  double zc = mean.z();
 
-  if (!std::isfinite(slope) || chi2ndf > MAX_STUB_CHI2NDF)
+  double denom_xy = ux*ux + uy*uy;
+  double t_dca    = -(x0*ux + y0*uy) / denom_xy;
+
+  double x_dca = x0 + ux * t_dca;
+  double y_dca = y0 + uy * t_dca;
+  double z_dca = zc + uz * t_dca;
+
+  double r_dca = std::sqrt(x_dca*x_dca + y_dca*y_dca);
+
+  // sign convention for DCA (left/right of direction)
+  double sign = ((x_dca*uy - y_dca*ux) >= 0.0) ? 1.0 : -1.0;
+  dca = sign * r_dca;
+  z0  = z_dca;
+
+  // 5) chi2 / ndf using 3D distance to the line
+  double chi2 = 0.0;
+  for (const auto &p : pts3)
   {
-    slope = 0;
-    intercept = 0;
+    Eigen::Vector3d diff = p - mean;
+    double t = diff.dot(dir);
+    Eigen::Vector3d proj = mean + t * dir;
+    Eigen::Vector3d res  = p - proj;
+    chi2 += res.squaredNorm();
+  }
+
+  const double ndof        = count - 2;
+  const double chi2ndf     = (ndof > 0) ? chi2 / ndof : 1e9;
+  const double MAX_CHI2NDF = 0.5;  // tweak as needed
+
+  std::cout << " stub 3D fit: nhit=" << count
+            << " dca="    << dca
+            << " phi="    << phi
+            << " theta="  << theta
+            << " z0="     << z0
+            << " chi2/ndf=" << chi2ndf
+            << std::endl;
+
+  if (!std::isfinite(dca)   || !std::isfinite(phi)   ||
+      !std::isfinite(theta) || !std::isfinite(z0)    ||
+      chi2ndf > MAX_CHI2NDF)
+  {
+    std::cout << " get_stub: bad fit, rejecting stub" << std::endl;
+    dca   = 0.;
+    phi   = 0.;
+    z0    = 0.;
+    theta = 0.;
     count = 0;
     return;
   }
@@ -458,6 +515,9 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
   float phimax = -99999999999.9;
   float dcamin = 99999999999.9;
   float dcamax =-99999999999.9;
+
+  float thetamin =  99999999999.9;
+  float thetamax = -99999999999.9;
 
   std::cout << "!!!!!!!!!number of clusters in event: " << _cluster_map->size() << endl;
   if(_cluster_map->size()<_min_nclusters){
@@ -543,60 +603,69 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
     float pointx = pointr * std::cos(pointphi);
     float pointy = pointr * std::sin(pointphi);
 
-    int    fcount     = 0;
-    double fslope     = 0;
-    double fintercept = 0;
+    int    fcount   = 0;
+    double fdca     = 0.;
+    double fphi     = 0.;
+    double fz0      = 0.;
+    double ftheta   = 0.;
+
+    // ...
 
     std::cout << " Processing cluster at r=" << pointr
               << " phi=" << pointphi
-              << " z=" << pointz
-              << " (x=" << pointx << ", y=" << pointy << ")"
+              << " z="   << pointz
+              << " (x="  << pointx << ", y=" << pointy << ")"
               << std::endl;
 
-    // search for local stub around (r,phi,z)
-    get_stub(rtree, pointr, pointphi, pointz, fcount, fslope, fintercept);
+    // 3D stub fit: returns (dca, phi, z0, theta)
+    get_stub(rtree, pointr, pointphi, pointz,
+            fcount, fdca, fphi, fz0, ftheta);
 
-    if (fcount <= 0) continue;
-    if (std::isnan(fslope) || !std::isfinite(fslope)) continue;
-    if (fslope ==0 && fintercept ==0) continue;
+if (fcount <= 0) continue;
+if (!std::isfinite(fdca) || !std::isfinite(fphi)) continue;
+if (fdca == 0.0 && fphi == 0.0) continue;
 
-    if (std::isfinite(fslope))
+    if (std::isfinite(fdca))
     {
       // convert (slope, intercept) -> (phi, dca) in XY
-      const double phi = std::atan(fslope);
-      const double dca = fintercept / std::sqrt(fslope*fslope + 1.0);
-      if (dca ==0 && phi ==0) continue;
+ //     const double phi = std::atan(fslope);
+   //   const double dca = fintercept / std::sqrt(fslope*fslope + 1.0);
+   //   if (dca ==0 && phi ==0) continue;
 
       // insert stub in Hough space (dca, phi)
-      rtree_stub.insert(std::make_pair(point(dca, phi, 0.0), 0));
+      rtree_stub.insert(std::make_pair(point(fdca, fphi, ftheta), 0));
 
       if(_write_ntp)
       {
         // store: ev, dca, phi, tanphi(=phi for now), x0(=dca)
         _ntp_stub->Fill(_nevent,
-                        static_cast<float>(dca),
-                        static_cast<float>(phi),
-                        static_cast<float>(phi),
-                        static_cast<float>(dca));
+                        static_cast<float>(fdca),
+                        static_cast<float>(fphi),
+                        static_cast<float>(ftheta),
+                        static_cast<float>(fz0));
 
-        _hHough->Fill(dca, phi);
+        _hHough->Fill(fdca, fphi);
       }
 
       // update Hough space ranges
-      if(phi > phimax) phimax = phi;
-      if(phi < phimin) phimin = phi;
-      if(dca > dcamax) dcamax = dca;
-      if(dca < dcamin) dcamin = dca;
+      if (fphi > phimax) phimax = fphi;
+      if (fphi < phimin) phimin = fphi;
+      if (fdca > dcamax) dcamax = fdca;
+      if (fdca < dcamin) dcamin = fdca;
+      if (ftheta > thetamax) thetamax = ftheta;
+      if (ftheta < thetamin) thetamin = ftheta;
 
       std::cout << " stub fit count: " << fcount
-                << " phi: " << phi << " ( " << phimin << " ; " << phimax << " ) "
-                << " dca: " << dca << " ( " << dcamin << " ; " << dcamax << " ) "
+                << " phi: " << fphi << " ( " << phimin << " ; " << phimax << " ) "
+                << " dca: " << fdca << " ( " << dcamin << " ; " << dcamax << " ) "
+                << " theta: " << ftheta
+                << " z0: " << fz0
                 << std::endl;
     }
   }
 
   // find clusters of (dca, phi) pairs in Hough space
-  map<int,pair<float,float>> outtrkmap; // key: multiplicity, value: (dca, phi)
+  std::map<int, HoughPeak> outtrkmap;  // key: multiplicity, value: (dca, phi)
   int nout = 0;
 
   while(rtree_stub.size()>10)
@@ -604,19 +673,21 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
     std::vector<pointKey> allstubs;
     rtree_stub.query(
       bgi::intersects(
-        box(point(dcamin, phimin, -1),
-            point(dcamax, phimax,  1))),
+        box(point(dcamin, phimin, thetamin),
+            point(dcamax, phimax, thetamax))),
       std::back_inserter(allstubs));
 
-    map<int,pair<float,float>> trkmap;
+    std::map<int, HoughPeak> trkmap;
 
     float phi_width = (phimax - phimin)/30;
+    float theta_width = (thetamax - thetamin)/20;
 
     for(vector<pointKey>::iterator stub = allstubs.begin();
         stub!=allstubs.end();++stub)
     {
       float p_dca = stub->first.get<0>();
       float p_phi = stub->first.get<1>();
+      float p_theta = stub->first.get<2>();
 
       float dca_width = dcaBinWidth(p_dca);
 
@@ -627,41 +698,53 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
 
       std::cout << " Searching box around stub dca: " << p_dca
                 << " phi: " << p_phi
+                << " theta: " << p_theta
                 << " dca_w: " << dca_width
-                << " phi_w: " << phi_width << std::endl;
+                << " phi_w: " << phi_width
+                << " theta_w: "<< theta_width << std::endl;
 
       vector<pointKey> trkcand;
       rtree_stub.query(
         bgi::intersects(
-          box(point(dlow,      p_phi - phi_width, -1),
-              point(dhigh,     p_phi + phi_width,  1))),
+          box(point(dlow,      p_phi - phi_width, p_theta - theta_width),
+              point(dhigh,     p_phi + phi_width, p_theta + theta_width))),
         std::back_inserter(trkcand));
 
       int   ntrk   = trkcand.size();
       int   count  = 0;
       float dca_sum  = 0;
       float phi_sum  = 0;
-
-      if(ntrk>=5)
+      float theta_sum = 0.f; 
+      if(ntrk>=3)
       {
         for(vector<pointKey>::iterator ptrk = trkcand.begin();
             ptrk!=trkcand.end();++ptrk)
         {
           float trk_dca = ptrk->first.get<0>();
           float trk_phi = ptrk->first.get<1>();
+          float trk_theta = ptrk->first.get<2>();
 
-          cout<< "    stub " << ntrk
-              << " dca: " << trk_dca
-              << " phi: " << trk_phi
+          cout << "    stub " << ntrk
+              << " dca: "   << trk_dca
+              << " phi: "   << trk_phi
+              << " theta: " << trk_theta
               << endl;
+
 
           dca_sum += trk_dca;
           phi_sum += trk_phi;
+          theta_sum += trk_theta;
           count++;
         }
         float mean_dca = (dca_sum/count);
         float mean_phi = (phi_sum/count);
-        trkmap[ntrk]   = std::make_pair(mean_dca, mean_phi); 
+        float mean_theta = theta_sum / count; 
+
+        HoughPeak peak;
+        peak.dca   = mean_dca;
+        peak.phi   = mean_phi;
+        peak.theta = mean_theta;
+        trkmap[ntrk] = peak;
               
         cout<< " stub in box " << ntrk
             << " dca_center: " << p_dca
@@ -679,12 +762,14 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
       int size_before = rtree_stub.size();
      
       cout << "mapend: " << trkmap.rbegin()->first
-           << " votes | " << (trkmap.rbegin()->second).first
-           << " dca | " << trkmap.rbegin()->second.second  << " phi | "<< endl;
+          << " votes | " << trkmap.rbegin()->second.dca
+          << " dca | "    << trkmap.rbegin()->second.phi
+          << " phi | "    << trkmap.rbegin()->second.theta
+          << " theta | "  << endl;
 
-      // remove stubs in the most populated Hough cell
-      float best_dca = trkmap.rbegin()->second.first;
-      float best_phi = trkmap.rbegin()->second.second;
+      float best_dca   = trkmap.rbegin()->second.dca;
+      float best_phi   = trkmap.rbegin()->second.phi;
+      float best_theta = trkmap.rbegin()->second.theta;  
 
       float dca_width = dcaBinWidth(best_dca);
 
@@ -700,8 +785,8 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
       vector<pointKey> rmcand;
       rtree_stub.query(
         bgi::intersects(
-          box(point(dlow,      best_phi - phi_width, -1),
-              point(dhigh,     best_phi + phi_width,  1))),
+          box(point(dlow,      best_phi - phi_width,  best_theta - theta_width),
+              point(dhigh,     best_phi + phi_width,  best_theta + theta_width))),
         std::back_inserter(rmcand));
 
       for(vector<pointKey>::iterator rmstub = rmcand.begin();
@@ -721,7 +806,7 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
       if(size_before == size_after) {break;}
 
       // store this Hough peak (dca, phi)
-      outtrkmap[nout++] = std::make_pair(best_dca, best_phi);
+      outtrkmap[nout++] = trkmap.rbegin()->second;
       cout << " tree size after remove: " << rtree_stub.size() << endl;
     }
     else
@@ -734,15 +819,21 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
   int numberofseeds = 0;
   bool keep_event = false;
 
-  for (const auto& [key, value] : outtrkmap)
+  for (const auto& kv : outtrkmap)
   {
+    int       key   = kv.first;
+    const HoughPeak& value = kv.second;
   
-    std::cout <<" out ev: " << _nevent << '[' << key << "] = "
-              << value.first << " | " << value.second << std::endl;
+
+    std::cout << " out ev: " << _nevent << '[' << key << "] = "
+            << value.dca   << " | " 
+            << value.phi   << " | "
+            << value.theta << std::endl;
 
     // Hough parameters
-    float dca = value.first;
-    float phi = value.second;
+    float dca = value.dca;
+    float phi = value.phi;
+    // float theta = value.theta;
 
     // Line in standard form a x + b y + c = 0 using (phi, dca)
     // Choose normal n = (sin(phi), -cos(phi)) with |n|=1, c = -dca
@@ -823,7 +914,7 @@ int HoughTrackFinder::process_event(PHCompositeNode* topNode)
       
       cout << " x: " << ptx << " y: " << pty << " res " << res << endl;
 
-      if(res<1.)
+      if(res<0.5)
       {
         trkclusters.push_back(*clustertrk);
       }

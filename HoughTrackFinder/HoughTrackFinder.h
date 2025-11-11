@@ -142,13 +142,25 @@ class HoughTrackFinder : public SubsysReco
   double costfunction(const double *xx);
 
   // stub finder: still fits y = m x + b in XY and returns slope/intercept
-  void get_stub(const myrtree &rtree,
-                float pointx, float pointy, float pointz,
-                int &count, double &slope, double &intercept);
+void get_stub(const myrtree &search_rtree,
+              float pointr, float pointphi, float pointz,
+              int &count,
+              double &dca,
+              double &phi,
+              double &z0,
+              double &theta);
+
 
 #ifndef __CINT__
  private:
   int createNodes(PHCompositeNode *topNode);
+
+  struct HoughPeak
+  {
+    float dca;
+    float phi;
+    float theta;
+  };
 
   std::string        m_trackMapName   = "TpcTrackSeedContainer";
   TrackSeedContainer *m_seedContainer = nullptr;
